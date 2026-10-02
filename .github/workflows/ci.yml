@@ -1,0 +1,29 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: unzip -q RadekiOSNative.zip
+      - run: make -C RadekiOSNative SAN=1 test
+      - run: make -C RadekiOSNative clean && make -C RadekiOSNative -j4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: radeki-linux-x86_64
+          path: RadekiOSNative/build/radeki
+  android-arm64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: unzip -q RadekiOSNative.zip
+      - run: sudo apt-get install -y ninja-build
+      - run: |
+          cmake -S RadekiOSNative -B out -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: radeki-android-arm64
+          path: out/radeki
