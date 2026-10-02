@@ -1,0 +1,78 @@
+# Changelog
+
+All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
+file is the channel log for that artifact and lives beside it in the repository root.
+
+## 2026-10-03 - multi-image loading and Objective-C metadata reading
+
+Test suite: **213 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
+
+### Added
+- **`loader/dyld.*` - dyld-style image registry.** Register an executable plus any number of
+  dylibs; `linkAll()` orders them dependency-first, gives each one a 16K-aligned load base and
+  slide, and binds imports across images: two-level lookup by install name, `LC_REEXPORT_DYLIB`
+  chains (depth-limited), and flat-namespace lookups. `linkAll()` runs two passes - the first
+  fixes each image's layout and size, the second binds against the complete export table - so a
+  flat-namespace import can bind to an image registered *after* its importer, the way dyld binds
+  only once every image is mapped. Unbound strong imports keep their named BRK trap stubs; failed
+  images report why in `LoadResult::errors` and cannot satisfy anyone's import.
+- **`objc/objc.*` - read-only Objective-C metadata reading.** Walks `__objc_classlist`,
+  `__objc_catlist` and `__objc_protolist` into classes (through `class_ro_t`), metaclasses,
+  categories and protocols, including methods in both the classic absolute-pointer (24-byte) and
+  the relative (12-byte) encodings, ivars (32/20-byte), properties (16/8-byte) and protocol
+  lists (absolute and relative encodings). It is not a runtime: nothing is registered,
+  dispatched or called.
+- **`runtime::runLoadedImage()`** - maps a whole linked image set into one process reservation
+  (so every image keeps its assigned slide), applies per-image W^X protections and runs the
+  images in link order, reporting per-image results. Requires an ARM64 host and says so plainly
+  when it does not have one.
+- **CLI**: `radeki load <exe> [--dylib <path>]...` and `radeki run ...`, plus `analyze --objc`
+  for the full metadata dump. Exit code 3 now means "linked, but some imports had no provider";
+  unknown options are rejected instead of ignored.
+- **libSystem subset** grew: `_strcat`, `_strncat`, `_strstr`, `_strrchr`, `_strtol`, `_strtoul`,
+  `_atol`, `_strerror`, common libm entry points, and a pthread subset (`_pthread_create`,
+  `_pthread_join`, `_pthread_self`, static non-recursive mutexes) behind written trampolines.
+
+### Changed
+- **Validation now walks real instruction ranges.** `relinker::LinkedImage` records the slid
+  ranges of sections carrying `S_ATTR_PURE_INSTRUCTIONS`/`S_ATTR_SOME_INSTRUCTIONS`, plus the
+  trap stubs and any veneer in use; `validate()` uses those instead of disassembling whole
+  executable segments. Mach-O headers, load commands and string constants in `__TEXT` are no
+  longer decoded as code, which removes false violations (and stops real violations from hiding
+  behind the same effect).
+- Test images: `synth::objcImage()` (a full metadata-bearing ARM64 image, 41 rebase fixups) and
+  `synth::dylib()` (a minimal dylib exporting `_missing_fn`/`_flat_sym`); `synth::build()` gained
+  a flat-namespace (`ordinal -2`) import option.
+- `progress.json` and `capabilities.json` updated, including the new gaps.
+
+### Known limits (unchanged or newly documented)
+- The runtime has still never executed on ARM64 hardware; the multi-image path is verified at
+  link level only.
+- No dyld shared cache, no `@rpath`/`@executable_path` expansion, no cross-image initializer
+  ordering, no weak-symbol coalescing.
+- Objective-C metadata is read but not used for dispatch; there is no `NSObject`, no selector
+  table, no class registration.
+- ARM64e PAC, ARMv7 AOT, TLS, variadic calls and encrypted binaries remain unsupported.
+
+## 2026-10-02 - initial foundation (as shipped in the first `RadekiOSNative.zip`)
+
+- Mach-O parser: thin/fat, 32/64-bit, load commands, symbols, dyld-info rebase/bind, chained
+  fixups, function starts, data-in-code, encryption info; malformed input rejected.
+- Analyzer: functions, call/branch/ADRP xrefs, PAC instruction counts, framework and
+  ObjC/Swift/Metal/GLES hints, static blockers.
+- ARM64 relinker: slide, rebase, bind, trap stubs for unresolved imports, B/BL veneers,
+  reference validator.
+- Runtime: mmap + W^X + signal-safe call into guest code, libSystem subset, JNI bridge, guest
+  process service, on-device self-test button.
+- Android app skeleton and a CI workflow that unzips the source, runs the host tests and
+  publishes a debug APK as a release.
+
+## Channel notes
+
+- The artifact is `RadekiOSNative.zip` in the repository root; everything under it is the
+  project source tree.
+- Chronology of a change: edit the source tree → re-zip → commit → CI (`build`) unzips, runs
+  `make -C RadekiOSNative SAN=1 test`, builds `assembleDebug` and publishes
+  `RadekiOSNative.apk` as release `build-<run number>`.
+- A change is only listed here once the host test suite passes; claims that need hardware are
+  marked as such in `progress.json` and `capabilities.json`.
