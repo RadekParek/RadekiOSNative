@@ -8,6 +8,11 @@ add_library(radeki STATIC mach_o/macho.cpp binary_analysis/analysis.cpp objc/obj
                             compat/status.cpp compat/matrix.cpp ipa/inflate.cpp ipa/png.cpp ipa/plist.cpp ipa/bundle.cpp)
 target_include_directories(radeki PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(radeki PRIVATE -Wall -Wextra)
+# Bionic's __android_log_write (guest output on the device) lives in liblog, which the NDK never
+# links implicitly; without it the Android link of any radeki consumer fails on that symbol.
+if(ANDROID)
+  target_link_libraries(radeki PUBLIC log)
+endif()
 add_executable(radeki_cli tools/radeki.cpp)
 set_target_properties(radeki_cli PROPERTIES OUTPUT_NAME radeki)
 target_link_libraries(radeki_cli radeki)

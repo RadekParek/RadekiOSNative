@@ -3,6 +3,21 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - Android CLI link fix (missing liblog)
+
+Host suite: **487 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
+
+- Fixed the failing `android-arm64` CI job. The root `CMakeLists.txt` built the `radeki` library
+  and CLI without linking `liblog`, so the `__android_log_write` call added to
+  `runtime/compat_libsystem.cpp` (guest output on the device) left the Android link with an
+  undefined symbol. The library now links `log` on Android (`PUBLIC`, so the CLI inherits it),
+  which is what `android/app/src/main/cpp/CMakeLists.txt` has always done for the JNI library.
+- Reproduced the failure and the fix at source level: with the sources compiled for
+  `__ANDROID__` and `liblog` absent, the link fails on exactly `__android_log_write`, and it
+  succeeds once `liblog` is provided. No C++ source changed, so host builds and the 487-check
+  suite are unaffected. The NDK toolchain is not installed in the environment where this fix was
+  prepared, so the real arm64-v8a cross-build is confirmed by the CI job itself.
+
 ## 2026-10-03 - libc++ hash-table crash fix, launch-path overhead and UIKit status clarity
 
 Host suite: **486 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
