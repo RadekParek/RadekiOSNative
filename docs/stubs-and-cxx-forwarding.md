@@ -77,8 +77,9 @@ become logging stubs instead, which is still visible.
 
 `runtime/framework_stubs.*` registers the hand-written end:
 
-* written shims (`COMPATIBILITY_SHIM`, method `shim`): `_UIApplicationMain` (logs that there
-  is no UIKit event loop/screen and returns 0 only to let the guest tear down), `_NSLog`, the
+* written shims (`COMPATIBILITY_SHIM`, method `shim`): `_UIApplicationMain` (runs the
+  EGL/CADisplayLink frame loop described in "UIKit status and launch limits" below; it exits
+  when the Android Surface is destroyed or the host requests it), `_NSLog`, the
   objc memory family (`objc_retain` & co. pass
   the object through instead of nil-ing it; `objc_release`/`objc_storeStrong` are no-ops;
   `objc_autoreleasePoolPush/Pop` hand out a stable token), `sel_registerName`/`sel_getUid`,
@@ -132,11 +133,23 @@ a redundant second compatibility registry in fallback mode.
 ## UIKit status and launch limits
 
 The analyzer continues to report **UIKit unsupported**. That is intentional and accurate: the
-runtime has a few startup shims and dummy class objects, not a UIKit object model, view tree,
-application event loop, or Android surface presentation path. In particular, the placeholder
-`UIApplicationMain` returns immediately and does not render a boot screen. Similar limits remain
-for Foundation/CoreFoundation and full EAGL integration. These gaps require real subsystem work;
-changing the capability label or returning success from no-op functions would only hide failures.
+runtime has startup shims and dummy class objects, not a UIKit object model, view tree or
+responder chain. What `UIApplicationMain` does provide since the EGL/heartbeat batch is a real
+frame loop on the guest's main (render) thread: it applies queued EGL surface rebinds (Android
+Surface create/resize on the UI thread never touches `eglMakeCurrent` while the render thread
+owns the context, which is what produced EGL_BAD_ACCESS 0x3002 before), drains forwarded touch
+events, invokes the registered CADisplayLink target selector every frame cycle (60 FPS target,
+guest `frameInterval` honored, one-way 30 FPS fallback after a second of missed deadlines), and
+calls `eglSwapBuffers` right after the render step when the guest did not present itself.
+
+That loop is plumbing, not UIKit: the CADisplayLink callback goes through the `objc_msgSend`
+shim, and without a real Objective-C runtime (class registration, method lookup) the guest's
+actual `-tick:`/render method never executes, so no game frame is drawn yet. `successfulSwaps`
+in the run log/RTLS heartbeat therefore proves the Android EGL pipeline presented, not that
+Minecraft rendered. Similar limits remain for Foundation/CoreFoundation and full EAGL
+integration; the sandbox tree (incl. `Documents/games/com.mojang/`) is verified on disk at
+launch. These gaps require real subsystem work; changing a capability label or returning
+success from no-op functions would only hide failures.
 
 ## Verified / not verified
 

@@ -116,16 +116,60 @@ std::vector<std::string> standardSandboxDirectories() {
   };
 }
 
+// The standard iOS container sub-tree every guest launch must find, including the Minecraft
+// PE data folder under Documents/games/com.mojang/.
+const char* const kSandboxTreeRels[] = {"Documents/",
+                                        "Documents/games/com.mojang/",
+                                        "Library/Application Support/",
+                                        "Library/Caches/",
+                                        "tmp/"};
+
+// Independent stat()-based verification (create_directories reports errors, this confirms the
+// tree is actually present on the filesystem afterwards).
+bool verifySandboxTreeAt(const std::string& base) {
+  for (const char* rel : kSandboxTreeRels) {
+    struct stat st{};
+    if (::stat((base + rel).c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+  }
+  return true;
+}
+
+// Run-log notification, deduplicated per (base, fallback) state so the frequent
+// ensureSandboxDirectories() calls never spam the log.
+void noteSandboxVerified(const std::string& hostBase, bool fallback) {
+  static std::mutex mu;
+  static std::string loggedBase;
+  static bool loggedFallback = false;
+  static bool loggedAnything = false;
+  const std::string base = normalizeSlash(hostBase, true);
+  const std::string games = base + "Documents/games/com.mojang";
+  std::lock_guard<std::mutex> lock(mu);
+  if (loggedAnything && loggedBase == base && loggedFallback == fallback) return;
+  loggedAnything = true;
+  loggedBase = base;
+  loggedFallback = fallback;
+  if (fallback)
+    logRunEvent("sandbox fallback active: guest paths map onto " + base +
+                "; com.mojang tree verified at " + games);
+  else
+    logRunEvent("sandbox tree verified at " + base + "; com.mojang data folder ready at " + games);
+}
+
+void noteSandboxUnavailable() {
+  static std::mutex mu;
+  static bool logged = false;
+  std::lock_guard<std::mutex> lock(mu);
+  if (logged) return;
+  logged = true;
+  logRunEvent("sandbox creation failed: neither /storage/emulated/0/RadekiOSNative/sandbox nor "
+              "the scoped-storage or temp fallbacks could be created; guest file I/O will fail");
+}
+
 // Returns true iff all standard directories exist on the given base (after create_directories).
 bool tryCreateSandboxAt(const std::string& base) {
   namespace fs = std::filesystem;
   bool allOk = true;
-  const char* rels[] = {"Documents/",
-                        "Documents/games/com.mojang/",
-                        "Library/Application Support/",
-                        "Library/Caches/",
-                        "tmp/"};
-  for (const char* rel : rels) {
+  for (const char* rel : kSandboxTreeRels) {
     std::error_code ec;
     std::string p = base + rel;
     fs::create_directories(p, ec);
@@ -143,7 +187,11 @@ bool ensureSandboxDirectories() {
     if (g_sandboxBase != defaultBase) {
       g_useFallbackMirror = false;
       g_fallbackMirrorPath.clear();
-      return tryCreateSandboxAt(g_sandboxBase);
+      const std::string base = normalizeSlash(g_sandboxBase, true);
+      bool ok = tryCreateSandboxAt(base) && verifySandboxTreeAt(base);
+      if (ok) noteSandboxVerified(base, false);
+      else noteSandboxUnavailable();
+      return ok;
     }
   }
   // 1) Primary path: /storage/emulated/0/RadekiOSNative/sandbox/
@@ -153,6 +201,7 @@ bool ensureSandboxDirectories() {
     g_fallbackMirrorPath.clear();
     g_sandboxBase = defaultBase;
     g_guestCwd = normalizeSlash(g_sandboxBase + "Documents", false);
+    if (verifySandboxTreeAt(defaultBase)) noteSandboxVerified(defaultBase, false);
     return true;
   }
   // 2) Scoped-storage fallback: /storage/emulated/0/Android/data/org.radekiosnative.recompiler/files/sandbox/
@@ -163,6 +212,7 @@ bool ensureSandboxDirectories() {
     g_fallbackMirrorPath = scoped;
     g_sandboxBase = defaultBase;  // logical base unchanged
     g_guestCwd = normalizeSlash(g_sandboxBase + "Documents", false);
+    if (verifySandboxTreeAt(scoped)) noteSandboxVerified(scoped, true);
     return true;
   }
   // 3) Host-temp mirror (for non-Android build hosts / restricted environments).
@@ -175,7 +225,27 @@ bool ensureSandboxDirectories() {
     g_sandboxBase = defaultBase;
     g_guestCwd = normalizeSlash(g_sandboxBase + "Documents", false);
   }
+  if (mirrorOk && verifySandboxTreeAt(mirror)) noteSandboxVerified(mirror, true);
+  else if (!mirrorOk) noteSandboxUnavailable();
   return mirrorOk;
+}
+
+SandboxStatus currentSandboxStatus() {
+  ensureSandboxDirectories();
+  SandboxStatus status;
+  std::string hostBase;
+  {
+    std::lock_guard<std::mutex> lock(g_sandboxMutex);
+    status.base = normalizeSlash(g_sandboxBase, true);
+    status.usingFallback = g_useFallbackMirror;
+    hostBase = g_useFallbackMirror && !g_fallbackMirrorPath.empty()
+                   ? normalizeSlash(g_fallbackMirrorPath, true)
+                   : status.base;
+  }
+  status.hostBase = hostBase;
+  status.gamesMojangPath = normalizeSlash(hostBase + "Documents/games/com.mojang", false);
+  status.ready = verifySandboxTreeAt(hostBase);
+  return status;
 }
 
 std::string translateGuestPath(const std::string& guestPath) {

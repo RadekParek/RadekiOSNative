@@ -25,7 +25,7 @@
     ]
   },
   "tests": {
-    "checks": 518,
+    "checks": 540,
     "failures": 0,
     "run_with": [
       "make test",
@@ -78,7 +78,7 @@
     "libSystem subset is ~60 symbols; pthread support is a static non-recursive shim",
     "dispatch stubs and framework dummies keep calls alive and log them; they implement nothing (no rendering, no ObjC message dispatch), and C++ exceptions stay deliberately unsupported"
   ],
-  "next_blocker": "Real-device execution remains unverified. A visible iOS game boot screen still needs a working Objective-C runtime, UIKit/Foundation, an app loop, Android surface presentation and complete graphics support. Other host-side gaps include exports-trie/weak-bind support and fuller pthread/TLS compatibility.",
+  "next_blocker": "Real-device execution remains unverified. The EGL/Surface bridge, CADisplayLink heartbeat and frame presenting are host-tested plumbing, but a visible iOS game boot screen still needs a working Objective-C runtime (real objc_msgSend dispatch so the CADisplayLink target selector executes guest code), UIKit/Foundation, and complete graphics/audio/input support. Other host-side gaps include exports-trie/weak-bind support and fuller pthread/TLS compatibility.",
   "milestone2": {
     "name": "multi-image loading + Objective-C metadata reading",
     "done": [
@@ -132,6 +132,25 @@
       "AArch32 trampoline execution, Apple ARMv7 libc++ ABI and 32-bit Android device/game runtime",
       "Persistent Java UI paths and actual Surface/EGL rendering on a device",
       "Real iOS game boot to a visible screen"
+    ]
+  },
+  "milestone7": {
+    "name": "batch 7: EGL render-thread ownership, CADisplayLink heartbeat, frame presenting and sandbox verification",
+    "target": "Minecraft PE 0.10.4: EGL_BAD_ACCESS (0x3002) on Android Surface rebind, stalled CADisplayLink frame loop, no confirmed eglSwapBuffers, unverified sandbox tree",
+    "done": [
+      "EGL binding ownership is tracked per thread; Android Surface create/resize on the UI thread queues a rebind instead of rebuilding the surface in place, and the UIApplicationMain frame loop applies it on the render thread, so every eglMakeCurrent runs on the render thread",
+      "Before each eglSwapBuffers and before a surface rebuild, eglGetCurrentContext() is compared with the managed EGLContext and a foreign current context is explicitly unbound with eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) first (0x3002 avoidance); the loop releases the binding on exit",
+      "UIApplicationMain runs a CADisplayLink / engine frame heartbeat: 60 FPS target, guest setFrameInterval: honored, one-way 30 FPS fallback after 60 consecutive missed deadlines; the registered target selector is invoked every frame cycle and registration/first-callback are logged",
+      "eglSwapBuffers is called immediately after the guest frame render step when the guest did not present via presentRenderbuffer:; successfulSwaps and the new engineForcedSwaps counter advance and appear in the RTLS heartbeat and live status",
+      "Sandbox creation is verified on disk (stat-based, incl. Documents/games/com.mojang/) at the primary /storage/emulated/0 base or the scoped-storage/host-temp fallback, logged deduplicated, exposed via SandboxStatus in the result JSON and the black-screen panel",
+      "New threaded host test: Surface change on a foreign thread must defer (log-verified) and the render loop must apply it; 30 FPS cadence from frameInterval=2; sandbox status checked against the filesystem"
+    ],
+    "verified_on_host": "540 checks, 0 failures; clean under make SAN=1 test (ASan + UBSan); threaded deferral test stable over repeated runs; Android-target sources pass a -D__ANDROID__ -fsyntax-only sweep with simulated Android headers",
+    "not_verified": [
+      "No Android NDK/device in this environment: the arm64-v8a/armeabi-v7a builds and APK assembly are confirmed by CI only",
+      "eglMakeCurrent/eglSwapBuffers against a real device EGL stack, including the deferred rebind on an actual Surface resize",
+      "The CADisplayLink callback reaches the objc_msgSend shim; executing the guest's real -tick:/render method needs the still-missing Objective-C runtime, so visible MCPE frames remain unproven",
+      "Real Minecraft PE 0.10.4 launch to a visible, playable screen"
     ]
   }
 }

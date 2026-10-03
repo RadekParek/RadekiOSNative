@@ -224,6 +224,13 @@ public class GameActivity extends Activity {
             if (!last.isEmpty()) details += "\nLast graphics issue: " + last;
             if (!status.optBoolean("displayLinkRegistered") && loop)
                 details += "\nNo CADisplayLink callback is registered.";
+            if (loop && status.optBoolean("surfaceRebindPending"))
+                details += "\nAn EGL surface rebind is waiting for the render thread.";
+            details += "\nEngine frame heartbeat: " + status.optInt("heartbeatFps", 60) + " FPS target.";
+            if (status.optLong("engineForcedSwaps", 0) > 0)
+                details += " The loop presented " + status.optLong("engineForcedSwaps") + " frames itself.";
+            if (!status.optBoolean("sandboxReady", true))
+                details += "\nSandbox folders are missing; the game data path is not ready.";
             diagnosticsText.setText(issue + "\n\n" + details);
             diagnosticsPanel.setVisibility(View.VISIBLE);
         } catch (Throwable e) {
