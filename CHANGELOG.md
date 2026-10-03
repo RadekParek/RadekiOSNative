@@ -3,6 +3,31 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - honest compatibility status, C++ shims and offline IPA import (batch 2)
+
+Host suite: **344 checks, 0 failures**, including an ASan/UBSan clean run. Android/NDK builds
+and execution on an ARM64 device were **not** verified in this environment.
+
+- Added a 21-row capability matrix, explicit runtime state machine, and per-import classification.
+  Parsing or linking never implies a game is launchable; unsupported UIKit/GLES/etc. cannot
+  produce `RUNTIME_READY`.
+- Added per-image symbol/trap lookup, bounded recent compatibility-call history, ARM64 LR-based
+  call-site capture, and a single rich crash-result formatter.
+- Added real process-wide C++ exit registration/finalization and guarded initialization,
+  operator new/delete shims and distinct C `exit` / immediate `_exit`. Exception handling,
+  thread-local destructor semantics and unwinding remain **unsupported** and never pretend to work.
+- Added offline DEFLATE/zlib/CRC, PNG (including Apple's CgBI), XML/binary plist, and extracted
+  `.app` inspection. Icon selection is restricted to actual bundle contents, with square-icon
+  preference and warnings on missing icons; no network or invented art.
+- Added `radeki ipa` and `radeki symbols`, plus measured state/capabilities in `analyze`.
+- Renamed Android package to `org.radekiosnative.recompiler` and added dark UI, persistent
+  library, staged SAF IPA extraction, native metadata/analysis JSON, crash logs and dialog.
+  Java/Gradle/NDK compilation and real IPA compatibility still require device/toolchain checks.
+
+### Follow-up hardening
+- Bundle icon selection now resolves declared @2x/@3x/~ipad renditions and rejects icons symlinked outside the imported .app.
+- Android re-import preserves the prior bundle and icon until replacement inspection and library storage complete; library writes use AtomicFile.
+
 ## 2026-10-03 - multi-image loading and Objective-C metadata reading
 
 Test suite: **213 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
