@@ -42,6 +42,11 @@ std::optional<uint64_t> lookupCxxForward(const std::string& mangled);
 // Registers every table entry into a compat registry (classification ANDROID_BACKEND,
 // framework "libc++"). Called from makeCompatRegistry().
 void addCxxForwarding(relinker::CompatRegistry& reg);
+// Registers the libstdc++.6.dylib subset (red-black-tree helpers used by pre-libc++
+// std::map/set, plus inert SjLj context bookkeeping). Exception throw/resume machinery stays
+// unregistered on purpose -- the loader's named trap stubs report it. Called from
+// makeCompatRegistry().
+void addLibStdCxxForwarding(relinker::CompatRegistry& reg);
 
 // True for install names of Apple's C++ runtime dylibs (libc++.1.dylib, libc++abi.dylib).
 bool isAppleCxxDylib(const std::string& installName);

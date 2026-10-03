@@ -1,156 +1,182 @@
 {
-  "schema": 1,
-  "environment": "x86_64 host, g++12, make; Android SDK/NDK, Gradle, Java, CMake, Ninja, ARM cross compiler and QEMU unavailable locally",
-  "milestone1": {
-    "name": "synthetic ARM64 Mach-O -> analyzer -> relinker -> runtime -> native exec -> correct output",
-    "done": [
-      "synthetic ARM64 Mach-O generator",
-      "Mach-O parser",
-      "analyzer",
-      "relinker (slide, rebase, bind, trap stubs, veneers, validator)",
-      "CLI analyze/convert/validate",
-      "native runtime (mmap, W^X, signal-safe call into guest) + compat libSystem subset + JNI + guest-process service + on-device self-test button",
-      "Objective-C metadata reading (class_ro_t, methods in both encodings, ivars, properties, categories, protocols) - read-only",
-      "dyld-style image registry: multi-image load bases, dependency-first order, cross-image + re-export + flat binding, per-image unresolved reporting",
-      "runtime runs a whole linked image set in one reservation, provided all images match the native ARM64 or ARMv7 process ABI",
-      "code-range based validation (section instruction attributes) + hostile-metadata fuzzing"
-    ],
-    "verified_on_host": "relinked image executed by a test-only AArch64 interpreter; cross-image binding verified structurally (bound slots land inside the provider image, zero trap stubs when a provider exists)",
-    "not_done": [
-      "runtime has NOT been executed on an ARM64 device or compiled with the NDK by me",
-      "ObjC runtime (dispatch, class registration, method lookup), Foundation, UIKit, graphics, audio, input",
-      "variadic functions (printf etc.): Apple passes varargs on the stack, so they need special shims",
-      "TLS: Apple uses TPIDRRO_EL0, thread-locals unsupported",
-      "pthread shims: static non-recursive mutexes only; Apple's pthread_attr_t layout is ignored"
-    ]
-  },
-  "tests": {
-    "checks": 540,
-    "failures": 0,
-    "run_with": [
-      "make test",
-      "make SAN=1 test"
-    ]
-  },
-  "milestone4": {
-    "name": "batch 3: libc++ forwarding, framework stubs, dispatch-stub linker mode",
-    "target": "Minecraft PE 0.10.4 ARM64 halt in __GLOBAL__I_a17 (SIGTRAP on unbound libc++/framework imports)",
-    "done": [
-      "cxx_forward: explicit std::__1 basic_string wrappers (init/ctors/dtor/assign/append/reserve/resize/insert/compare/npos) + ios_base::Init, registered under Apple's exact mangled names, grow-only storage policy matching libc++",
-      "cxx_forward: chained dlsym(RTLD_DEFAULT) pass-through for _Z-mangled imports from Apple C++ dylibs (finds identical std::__1 symbols in the NDK libc++ on device)",
-      "stub_dispatch: RW->RX trampoline arena + naked dispatcher returning safe defaults (0/NULL/nil, YES, x0 pass-through, empty SEL) with per-symbol logging; data imports get labelled dummy objects",
-      "framework_stubs: written shims (UIApplicationMain, NSLog, objc memory family, autorelease pools, selector helpers, CF basics) + ~80 dummy _OBJC_CLASS_$_/_OBJC_METACLASS_$_ objects + constants",
-      "relinker/loader: opt-in stubFactory binding mode (default stays honest BRK traps); stubbed imports stay listed unresolved with stub addresses, NOOP_STUB classification, linkAll warning",
-      "loader::Registry::resolve documents the full Apple-vs-host pipeline; makeHostRuntime() packages the layer; radeki run/JNI run use it (--traps/--stubs flags)",
-      "initializer tracing names each __mod_init_func entry in the compat-call log"
-    ],
-    "verified_on_host": "486 checks, 0 failures, ASan/UBSan clean; libc++ string and next-prime wrappers, fixed call-history ring, trampoline encodings and both linker modes covered",
-    "not_verified": [
-      "ARM64 device execution of trampolines (test exists, guarded to aarch64 hosts)",
-      "dlsym hits against the NDK libc++ (c++_static/c++_shared)",
-      "Minecraft PE 0.10.4 actually passing __GLOBAL__I_a17"
-    ]
-  },
-  "milestone5": {
-    "name": "libc++ hash-table prime helper and MCPE ChunkPos follow-up",
-    "target": "Device report: SIGSEGV in __hash_table<ChunkPos>::__insert_unique after an unbound __next_prime(size_t) import returned zero",
-    "done": [
-      "Added the exact Apple libc++ __next_prime mangled import to the explicit compatibility table; preserves the zero sentinel and otherwise returns the smallest prime at least the requested bucket count",
-      "Uses deterministic 64-bit Miller-Rabin with bounded runtime; covered from small requests through a near-SIZE_MAX prime case",
-      "Replaced hot-path compatibility-call deque/string allocations with a fixed-size ring and const-char overload; avoided duplicate compatibility-registry setup in runImage()",
-      "Kept UIKit status explicitly Unsupported and clarified that startup shims do not implement the app UI/event loop or render a boot screen"
-    ],
-    "verified_on_host": "486 checks, 0 failures, clean under make SAN=1 test (ASan + UBSan)",
-    "not_verified": [
-      "Android NDK/APK build unavailable in this environment",
-      "The exact wrapper has not yet been exercised on an ARM64 device against this game binary",
-      "The game has not reached its visible boot screen; real UIKit, app loop/surface, Foundation and graphics support remain incomplete"
-    ]
-  },
-  "known_gaps": [
-    "ARM64e auth fixups refused (PAC layer missing)",
-    "encrypted binaries refused (not decrypted)",
-    "weak-bind opcodes and exports trie not interpreted",
-    "lazy binds bound eagerly",
-    "ARM64 and ARM32 APKs passed NDK/Gradle builds and content verification in GitHub Actions run 37125335912; native guest execution on a device is still unverified",
-    "ObjC metadata is read-only: no dispatch, no class registration, no method lookup",
-    "loader has no dyld shared cache, no @rpath expansion, no initializer ordering across images, no weak coalescing",
-    "libSystem subset is ~60 symbols; pthread support is a static non-recursive shim",
-    "dispatch stubs and framework dummies keep calls alive and log them; they implement nothing (no rendering, no ObjC message dispatch), and C++ exceptions stay deliberately unsupported"
+ "schema": 1,
+ "environment": "x86_64 host, g++12, make; Android SDK/NDK, Gradle, Java, CMake, Ninja; ARM cross compiler (gcc-cross 12.2 arm-linux-gnueabihf) and qemu-user available; ARM32 edition additionally built with -Wl,-Ttext-segment=0x40000000 so QEMU's own binary does not overlap a classic image loaded at its preferred vmaddr",
+ "milestone1": {
+  "name": "synthetic ARM64 Mach-O -> analyzer -> relinker -> runtime -> native exec -> correct output",
+  "done": [
+   "synthetic ARM64 Mach-O generator",
+   "Mach-O parser",
+   "analyzer",
+   "relinker (slide, rebase, bind, trap stubs, veneers, validator)",
+   "CLI analyze/convert/validate",
+   "native runtime (mmap, W^X, signal-safe call into guest) + compat libSystem subset + JNI + guest-process service + on-device self-test button",
+   "Objective-C metadata reading (class_ro_t, methods in both encodings, ivars, properties, categories, protocols) - read-only",
+   "dyld-style image registry: multi-image load bases, dependency-first order, cross-image + re-export + flat binding, per-image unresolved reporting",
+   "runtime runs a whole linked image set in one reservation, provided all images match the native ARM64 or ARMv7 process ABI",
+   "code-range based validation (section instruction attributes) + hostile-metadata fuzzing"
   ],
-  "next_blocker": "Real-device execution remains unverified. The EGL/Surface bridge, CADisplayLink heartbeat and frame presenting are host-tested plumbing, but a visible iOS game boot screen still needs a working Objective-C runtime (real objc_msgSend dispatch so the CADisplayLink target selector executes guest code), UIKit/Foundation, and complete graphics/audio/input support. Other host-side gaps include exports-trie/weak-bind support and fuller pthread/TLS compatibility.",
-  "milestone2": {
-    "name": "multi-image loading + Objective-C metadata reading",
-    "done": [
-      "loader/dyld.h|.cpp registry (resolve via two-level, re-export, flat; two-pass linkAll)",
-      "objc/objc.h|.cpp read-only metadata parser that never throws",
-      "CLI load/run commands and --objc dump; analyze reports ObjC counts",
-      "codeRange-based validation; --dylib repeatable"
-    ],
-    "coverage": "213 checks, 0 failures, ASan/UBSan clean; objc::parse must not throw, asserted by 3000 mutation iterations",
-    "not_done": [
-      "no dyld shared cache, no @rpath filesystem expansion, no cross-image initializer ordering, no weak coalescing",
-      "multi-image execution itself is unverified on hardware",
-      "ObjC metadata is not used to dispatch anything yet"
-    ]
+  "verified_on_host": "relinked image executed by a test-only AArch64 interpreter; cross-image binding verified structurally (bound slots land inside the provider image, zero trap stubs when a provider exists)",
+  "not_done": [
+   "runtime has NOT been executed on an ARM64 device or compiled with the NDK by me",
+   "ObjC runtime (dispatch, class registration, method lookup), Foundation, UIKit, graphics, audio, input",
+   "variadic functions (printf etc.): Apple passes varargs on the stack, so they need special shims",
+   "TLS: Apple uses TPIDRRO_EL0, thread-locals unsupported",
+   "pthread shims: static non-recursive mutexes only; Apple's pthread_attr_t layout is ignored"
+  ]
+ },
+ "tests": {
+  "checks": 2109,
+  "failures": 0,
+  "run_with": [
+   "make test",
+   "make SAN=1 test"
+  ]
+ },
+ "milestone4": {
+  "name": "batch 3: libc++ forwarding, framework stubs, dispatch-stub linker mode",
+  "target": "Minecraft PE 0.10.4 ARM64 halt in __GLOBAL__I_a17 (SIGTRAP on unbound libc++/framework imports)",
+  "done": [
+   "cxx_forward: explicit std::__1 basic_string wrappers (init/ctors/dtor/assign/append/reserve/resize/insert/compare/npos) + ios_base::Init, registered under Apple's exact mangled names, grow-only storage policy matching libc++",
+   "cxx_forward: chained dlsym(RTLD_DEFAULT) pass-through for _Z-mangled imports from Apple C++ dylibs (finds identical std::__1 symbols in the NDK libc++ on device)",
+   "stub_dispatch: RW->RX trampoline arena + naked dispatcher returning safe defaults (0/NULL/nil, YES, x0 pass-through, empty SEL) with per-symbol logging; data imports get labelled dummy objects",
+   "framework_stubs: written shims (UIApplicationMain, NSLog, objc memory family, autorelease pools, selector helpers, CF basics) + ~80 dummy _OBJC_CLASS_$_/_OBJC_METACLASS_$_ objects + constants",
+   "relinker/loader: opt-in stubFactory binding mode (default stays honest BRK traps); stubbed imports stay listed unresolved with stub addresses, NOOP_STUB classification, linkAll warning",
+   "loader::Registry::resolve documents the full Apple-vs-host pipeline; makeHostRuntime() packages the layer; radeki run/JNI run use it (--traps/--stubs flags)",
+   "initializer tracing names each __mod_init_func entry in the compat-call log"
+  ],
+  "verified_on_host": "486 checks, 0 failures, ASan/UBSan clean; libc++ string and next-prime wrappers, fixed call-history ring, trampoline encodings and both linker modes covered",
+  "not_verified": [
+   "ARM64 device execution of trampolines (test exists, guarded to aarch64 hosts)",
+   "dlsym hits against the NDK libc++ (c++_static/c++_shared)",
+   "Minecraft PE 0.10.4 actually passing __GLOBAL__I_a17"
+  ]
+ },
+ "milestone5": {
+  "name": "libc++ hash-table prime helper and MCPE ChunkPos follow-up",
+  "target": "Device report: SIGSEGV in __hash_table<ChunkPos>::__insert_unique after an unbound __next_prime(size_t) import returned zero",
+  "done": [
+   "Added the exact Apple libc++ __next_prime mangled import to the explicit compatibility table; preserves the zero sentinel and otherwise returns the smallest prime at least the requested bucket count",
+   "Uses deterministic 64-bit Miller-Rabin with bounded runtime; covered from small requests through a near-SIZE_MAX prime case",
+   "Replaced hot-path compatibility-call deque/string allocations with a fixed-size ring and const-char overload; avoided duplicate compatibility-registry setup in runImage()",
+   "Kept UIKit status explicitly Unsupported and clarified that startup shims do not implement the app UI/event loop or render a boot screen"
+  ],
+  "verified_on_host": "486 checks, 0 failures, clean under make SAN=1 test (ASan + UBSan)",
+  "not_verified": [
+   "Android NDK/APK build unavailable in this environment",
+   "The exact wrapper has not yet been exercised on an ARM64 device against this game binary",
+   "The game has not reached its visible boot screen; real UIKit, app loop/surface, Foundation and graphics support remain incomplete"
+  ]
+ },
+ "known_gaps": [
+  "ARM64e auth fixups refused (PAC layer missing)",
+  "encrypted binaries refused (not decrypted)",
+  "weak-bind opcodes and exports trie not interpreted",
+  "lazy binds bound eagerly",
+  "ARM64 and ARM32 APKs passed NDK/Gradle builds and content verification in GitHub Actions run 37125335912; native guest execution on a device is still unverified",
+  "ObjC metadata is read-only: no dispatch, no class registration, no method lookup",
+  "loader has no dyld shared cache, no @rpath expansion, no initializer ordering across images, no weak coalescing",
+  "libSystem subset is ~60 symbols; pthread support is a static non-recursive shim",
+  "dispatch stubs and framework dummies keep calls alive and log them; they implement nothing (no rendering, no ObjC message dispatch), and C++ exceptions stay deliberately unsupported"
+ ],
+ "next_blocker": "Real-device execution remains unverified. The EGL/Surface bridge, CADisplayLink heartbeat and frame presenting are host-tested plumbing, but a visible iOS game boot screen still needs a working Objective-C runtime (real objc_msgSend dispatch so the CADisplayLink target selector executes guest code), UIKit/Foundation, and complete graphics/audio/input support. Other host-side gaps include exports-trie/weak-bind support and fuller pthread/TLS compatibility.",
+ "milestone2": {
+  "name": "multi-image loading + Objective-C metadata reading",
+  "done": [
+   "loader/dyld.h|.cpp registry (resolve via two-level, re-export, flat; two-pass linkAll)",
+   "objc/objc.h|.cpp read-only metadata parser that never throws",
+   "CLI load/run commands and --objc dump; analyze reports ObjC counts",
+   "codeRange-based validation; --dylib repeatable"
+  ],
+  "coverage": "213 checks, 0 failures, ASan/UBSan clean; objc::parse must not throw, asserted by 3000 mutation iterations",
+  "not_done": [
+   "no dyld shared cache, no @rpath filesystem expansion, no cross-image initializer ordering, no weak coalescing",
+   "multi-image execution itself is unverified on hardware",
+   "ObjC metadata is not used to dispatch anything yet"
+  ]
+ },
+ "milestone3": {
+  "name": "batch 2 compatibility and IPA handling",
+  "verified_on_host": [
+   "344 checks, 0 failures",
+   "ASan/UBSan test suite",
+   "PNG/CgBI round trip; binary/XML plist; ZIP/DEFLATE decoders tested independently"
+  ],
+  "not_verified": [
+   "Android Gradle/NDK build (SDK/Gradle unavailable in host environment)",
+   "ARM64 device run",
+   "real-world IPA compatibility"
+  ],
+  "known_limitations": [
+   "Objective-C dispatch and UIKit absent",
+   "C++ exceptions/unwinding trap by symbol",
+   "thread atexit is process-wide",
+   "ZIP container extraction performed by Java ZipFile, not the C++ inflater"
+  ]
+ },
+ "milestone6": {
+  "name": "Persistent black-screen diagnostics, opt-in RTLS and ARM32 edition",
+  "done": [
+   "Every Android guest launch writes a private, bounded, persistent run log with game/ABI/settings metadata, guest output, native stage logs, graphics state and final crash/result JSON",
+   "Added recent-run history, latest-run card, copy/share log viewer, automatic first-return log prompt and a delayed black-screen panel with surface/EGL/event-loop/swaps diagnosis",
+   "RTLS preference defaults off; sampled compatibility calls and 5-second UIApplicationMain heartbeats are logged only when enabled; baseline output and errors remain recorded",
+   "Added ARM32 Mach-O selection, 4K relinking, 32-bit pointer rebases/binds, A32 BKPT stubs, A32 dispatch trampoline, pointer-width C++/pthread wrappers and a synthetic ARM32 self-test fixture",
+   "Separate arm64-v8a and armeabi-v7a Android product flavors; both NDK CLI builds, APK builds and packaged-ABI checks passed CI run 37125335912"
+  ],
+  "verified_on_host": "518 checks, 0 failures; clean under make SAN=1 test with ASan and UBSan after a clean rebuild. Tests cover durable native logging, RTLS off/on behavior, ARM32 Mach-O parsing/rebasing/traps, and 32-bit size_t mangling aliases.",
+  "verified_in_ci": {
+   "run": 37125335912,
+   "url": "https://github.com/RadekParek/RadekiOSNative/actions/runs/37125335912",
+   "jobs": "host regression/release build, Android ARM64 CLI NDK build, Android ARM32 CLI NDK build, both flavored APK builds and packaged JNI ABI checks"
   },
-  "milestone3": {
-    "name": "batch 2 compatibility and IPA handling",
-    "verified_on_host": [
-      "344 checks, 0 failures",
-      "ASan/UBSan test suite",
-      "PNG/CgBI round trip; binary/XML plist; ZIP/DEFLATE decoders tested independently"
-    ],
-    "not_verified": [
-      "Android Gradle/NDK build (SDK/Gradle unavailable in host environment)",
-      "ARM64 device run",
-      "real-world IPA compatibility"
-    ],
-    "known_limitations": [
-      "Objective-C dispatch and UIKit absent",
-      "C++ exceptions/unwinding trap by symbol",
-      "thread atexit is process-wide",
-      "ZIP container extraction performed by Java ZipFile, not the C++ inflater"
-    ]
-  },
-  "milestone6": {
-    "name": "Persistent black-screen diagnostics, opt-in RTLS and ARM32 edition",
-    "done": [
-      "Every Android guest launch writes a private, bounded, persistent run log with game/ABI/settings metadata, guest output, native stage logs, graphics state and final crash/result JSON",
-      "Added recent-run history, latest-run card, copy/share log viewer, automatic first-return log prompt and a delayed black-screen panel with surface/EGL/event-loop/swaps diagnosis",
-      "RTLS preference defaults off; sampled compatibility calls and 5-second UIApplicationMain heartbeats are logged only when enabled; baseline output and errors remain recorded",
-      "Added ARM32 Mach-O selection, 4K relinking, 32-bit pointer rebases/binds, A32 BKPT stubs, A32 dispatch trampoline, pointer-width C++/pthread wrappers and a synthetic ARM32 self-test fixture",
-      "Separate arm64-v8a and armeabi-v7a Android product flavors; both NDK CLI builds, APK builds and packaged-ABI checks passed CI run 37125335912"
-    ],
-    "verified_on_host": "518 checks, 0 failures; clean under make SAN=1 test with ASan and UBSan after a clean rebuild. Tests cover durable native logging, RTLS off/on behavior, ARM32 Mach-O parsing/rebasing/traps, and 32-bit size_t mangling aliases.",
-    "verified_in_ci": {
-      "run": 37125335912,
-      "url": "https://github.com/RadekParek/RadekiOSNative/actions/runs/37125335912",
-      "jobs": "host regression/release build, Android ARM64 CLI NDK build, Android ARM32 CLI NDK build, both flavored APK builds and packaged JNI ABI checks"
-    },
-    "not_verified": [
-      "AArch32 trampoline execution, Apple ARMv7 libc++ ABI and 32-bit Android device/game runtime",
-      "Persistent Java UI paths and actual Surface/EGL rendering on a device",
-      "Real iOS game boot to a visible screen"
-    ]
-  },
-  "milestone7": {
-    "name": "batch 7: EGL render-thread ownership, CADisplayLink heartbeat, frame presenting and sandbox verification",
-    "target": "Minecraft PE 0.10.4: EGL_BAD_ACCESS (0x3002) on Android Surface rebind, stalled CADisplayLink frame loop, no confirmed eglSwapBuffers, unverified sandbox tree",
-    "done": [
-      "EGL binding ownership is tracked per thread; Android Surface create/resize on the UI thread queues a rebind instead of rebuilding the surface in place, and the UIApplicationMain frame loop applies it on the render thread, so every eglMakeCurrent runs on the render thread",
-      "Before each eglSwapBuffers and before a surface rebuild, eglGetCurrentContext() is compared with the managed EGLContext and a foreign current context is explicitly unbound with eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) first (0x3002 avoidance); the loop releases the binding on exit",
-      "UIApplicationMain runs a CADisplayLink / engine frame heartbeat: 60 FPS target, guest setFrameInterval: honored, one-way 30 FPS fallback after 60 consecutive missed deadlines; the registered target selector is invoked every frame cycle and registration/first-callback are logged",
-      "eglSwapBuffers is called immediately after the guest frame render step when the guest did not present via presentRenderbuffer:; successfulSwaps and the new engineForcedSwaps counter advance and appear in the RTLS heartbeat and live status",
-      "Sandbox creation is verified on disk (stat-based, incl. Documents/games/com.mojang/) at the primary /storage/emulated/0 base or the scoped-storage/host-temp fallback, logged deduplicated, exposed via SandboxStatus in the result JSON and the black-screen panel",
-      "New threaded host test: Surface change on a foreign thread must defer (log-verified) and the render loop must apply it; 30 FPS cadence from frameInterval=2; sandbox status checked against the filesystem"
-    ],
-    "verified_on_host": "540 checks, 0 failures; clean under make SAN=1 test (ASan + UBSan); threaded deferral test stable over repeated runs; Android-target sources pass a -D__ANDROID__ -fsyntax-only sweep with simulated Android headers",
-    "not_verified": [
-      "No Android NDK/device in this environment: the arm64-v8a/armeabi-v7a builds and APK assembly are confirmed by CI only",
-      "eglMakeCurrent/eglSwapBuffers against a real device EGL stack, including the deferred rebind on an actual Surface resize",
-      "The CADisplayLink callback reaches the objc_msgSend shim; executing the guest's real -tick:/render method needs the still-missing Objective-C runtime, so visible MCPE frames remain unproven",
-      "Real Minecraft PE 0.10.4 launch to a visible, playable screen"
-    ]
-  }
+  "not_verified": [
+   "AArch32 trampoline execution, Apple ARMv7 libc++ ABI and 32-bit Android device/game runtime",
+   "Persistent Java UI paths and actual Surface/EGL rendering on a device",
+   "Real iOS game boot to a visible screen"
+  ]
+ },
+ "milestone7": {
+  "name": "batch 7: EGL render-thread ownership, CADisplayLink heartbeat, frame presenting and sandbox verification",
+  "target": "Minecraft PE 0.10.4: EGL_BAD_ACCESS (0x3002) on Android Surface rebind, stalled CADisplayLink frame loop, no confirmed eglSwapBuffers, unverified sandbox tree",
+  "done": [
+   "EGL binding ownership is tracked per thread; Android Surface create/resize on the UI thread queues a rebind instead of rebuilding the surface in place, and the UIApplicationMain frame loop applies it on the render thread, so every eglMakeCurrent runs on the render thread",
+   "Before each eglSwapBuffers and before a surface rebuild, eglGetCurrentContext() is compared with the managed EGLContext and a foreign current context is explicitly unbound with eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) first (0x3002 avoidance); the loop releases the binding on exit",
+   "UIApplicationMain runs a CADisplayLink / engine frame heartbeat: 60 FPS target, guest setFrameInterval: honored, one-way 30 FPS fallback after 60 consecutive missed deadlines; the registered target selector is invoked every frame cycle and registration/first-callback are logged",
+   "eglSwapBuffers is called immediately after the guest frame render step when the guest did not present via presentRenderbuffer:; successfulSwaps and the new engineForcedSwaps counter advance and appear in the RTLS heartbeat and live status",
+   "Sandbox creation is verified on disk (stat-based, incl. Documents/games/com.mojang/) at the primary /storage/emulated/0 base or the scoped-storage/host-temp fallback, logged deduplicated, exposed via SandboxStatus in the result JSON and the black-screen panel",
+   "New threaded host test: Surface change on a foreign thread must defer (log-verified) and the render loop must apply it; 30 FPS cadence from frameInterval=2; sandbox status checked against the filesystem"
+  ],
+  "verified_on_host": "540 checks, 0 failures; clean under make SAN=1 test (ASan + UBSan); threaded deferral test stable over repeated runs; Android-target sources pass a -D__ANDROID__ -fsyntax-only sweep with simulated Android headers",
+  "not_verified": [
+   "No Android NDK/device in this environment: the arm64-v8a/armeabi-v7a builds and APK assembly are confirmed by CI only",
+   "eglMakeCurrent/eglSwapBuffers against a real device EGL stack, including the deferred rebind on an actual Surface resize",
+   "The CADisplayLink callback reaches the objc_msgSend shim; executing the guest's real -tick:/render method needs the still-missing Objective-C runtime, so visible MCPE frames remain unproven",
+   "Real Minecraft PE 0.10.4 launch to a visible, playable screen"
+  ]
+ },
+ "milestone8": {
+  "name": "batch 8: Touch & Go 1.1 (armv6) support - libstdc++.6 forwarding, GLES1/OpenAL/AudioQueue stubs, classic slide-0 placement",
+  "target": "Touch & Go 1.1 (com.thegamecreators.TouchAndGo, armv6, classic Mach-O without dyld info, libstdc++.6 era)",
+  "done": [
+   "Loader: classic (pre-dyld-info) images now load at their preferred vmaddr with slide 0 - the only placement where their unrelocated internal pointers work; found by tracing a silent __DATA corruption that crashed the host heap during Touch & Go static init",
+   "libstdc++.6.dylib forwarding: real ports of libstdc++'s red-black-tree helpers (_Rb_tree_insert_and_rebalance, _Rb_tree_increment const+non-const, _Rb_tree_rebalance_for_erase) for pre-libc++ std::map/std::set; inert SjLj context register/unregister",
+   "CoreGraphics math subset: CGAffineTransform identity data symbol (real 24-byte constant), scale (Apple's definition), isIdentity",
+   "CoreFoundation CFArray subset: real create/append/get/count/removeAtIndex/removeAll over malloc-backed storage (NULL allocator/callbacks semantics)",
+   "objc_copyStruct: real sized struct copy",
+   "libSystem/libm: float and double math functions (sinf/cosf/tanf/atan2f/ceilf/floorf/logf/asin/acos/atan2/pow/log10/exp and friends), rand/srand, printf/sprintf (AAPCS varargs are ABI-compatible on the ARM32 edition)",
+   "libgcc legacy builtins: __divsi3/__udivsi3/__modsi3/__umodsi3 with hardware division semantics (divide-by-zero yields 0, overflow wraps)",
+   "pthread attr shims (documented no-ops, consistent with attr being ignored), pthread_mach_thread_np returning the pthread identity",
+   "Mach thread policy shims that refuse honestly (KERN_INVALID_POLICY=28 / KERN_INVALID_TASK=16) instead of fake success",
+   "Darwin __assert_rtn shim that prints and aborts",
+   "OpenGL ES 1.x fixed-function + OES framebuffer entry points as no-op stubs (no fixed pipeline on the host)",
+   "OpenAL + AudioToolbox (AudioQueue/AudioFile) limited stubs; alGetError returns AL_NO_ERROR; alcOpenDevice reports no device",
+   "CG raster-context, CGImage, CFURL and UIGraphics context shims use limited no-op/null-return paths, not real framework implementations",
+   "CLI run honors RADEKI_RUN_LOG for a persistent run log (parity with the Android launcher)"
+  ],
+  "verified_on_host": "The fork reports a QEMU ARM32 smoke test of Touch & Go 1.1 reaching UIApplicationMain after 50 static initializers and sustaining a 60 FPS heartbeat. The game binary/toolchain are not included here, so this checkout verifies the host regression suite only: 2109 checks, 0 failures; QEMU/device execution was not rerun.",
+  "not_verified": [
+   "No visible game screen: UIKit/Foundation object runtime, real objc dispatch, GLES1 rendering (fixed pipeline cannot forward to GLES2), and audio remain unimplemented",
+   "The QEMU ARM32 run is not device execution; on-device ARM32 behavior (real EGL, threads, timing) is unverified",
+   "64-bit host builds bind arm32 guests to trap stubs when shim addresses exceed the 32-bit line (by design; the ARM32 edition is the supported pairing)"
+  ]
+ }
 }

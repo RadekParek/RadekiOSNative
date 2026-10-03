@@ -57,6 +57,9 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
   li.loadBase = opt.loadBase;
   li.imageBase = minVm;
   li.slide = opt.loadBase - minVm;
+  if (img.classicBinds && li.slide != 0)
+    li.warnings.push_back("classic image (no relocation records): internal pointers are only correct at slide 0; "
+                          "link at the preferred vmaddr " + std::to_string(minVm) + " for correct data pointers");
   li.imageSize = imageSize;
   if (opt.loadBase + imageSize + (16ull << 20) < opt.loadBase) throw LinkError("loadBase overflows address space");
 
@@ -74,12 +77,20 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
     }
     std::optional<uint64_t> t;
     if (opt.resolver) t = opt.resolver->resolve(im.name, dylibOf[i]);
+    if (t && arm32 && *t > UINT32_MAX) {
+      // Host-side shims live above the 32-bit line; on a real ARM32 device they fit.
+      // Demote to a trap stub rather than aborting the whole link; still reported unresolved.
+      t.reset();
+      li.warnings.push_back("import " + im.name + ": resolved target exceeds the ARM32 address"
+                            " space (host shim); bound to trap stub");
+    }
     if (t) res[i] = {true, *t, -1, false};
     else if (!im.weak) {
       // Unresolved strong import. Default doctrine: a named BRK trap stub that reports itself.
       // With a stub factory (runtime "keep the startup loop alive" mode) the import binds to a
       // host-executable logging stub instead -- still reported unresolved, never faked.
       uint64_t stub = opt.stubFactory ? opt.stubFactory(im.name, dylibOf[i]) : 0;
+      if (stub && arm32 && stub > UINT32_MAX) stub = 0;  // host stub address above the 32-bit line: use a trap
       if (stub) res[i] = {false, stub, -1, true};
       else res[i] = {false, 0, int(trapCount++), false};
     }

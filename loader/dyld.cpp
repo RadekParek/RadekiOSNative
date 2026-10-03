@@ -204,12 +204,18 @@ LoadResult Registry::linkAll(const Options& opt) {
   // that is registered after its importer -- the case a flat-namespace lookup hits. Binding
   // does not change any image's size, so the pass-1 layout stays valid, and pass 2 can only
   // turn traps into real addresses, never the other way round.
+  struct MappedRange { uint64_t begin, end; size_t owner; };
+  std::vector<MappedRange> mappedRanges;
   auto runPass = [&](bool assignBases, bool collect) {
     uint64_t base = opt.firstBase;
     for (size_t idx : order) {
       Entry& e = entries_[idx];
       if (assignBases) {
-        e.loadBase = base;
+        // Classic (pre-dyld-info) images carry no rebase records: dyld 1 loaded them at
+        // their preferred vmaddr with slide 0, and every internal __DATA pointer is only
+        // valid there. Honoring the preferred vmaddr is not a preference, it is the only
+        // placement where the image works at all.
+        e.loadBase = e.image->classicBinds ? e.image->textBase() : base;
       } else if (e.failed || e.image == nullptr) {
         // Already known to be unloadable (pass 1 saw it fail). Its error still has to reach
         // the report -- silently skipping it would make LoadResult::ok() lie.
@@ -257,6 +263,33 @@ LoadResult Registry::linkAll(const Options& opt) {
       e.imageSize = e.linkedImage.imageSize;
       e.totalSize = e.linkedImage.totalSize;
 
+      // Classic images are placed at fixed preferred addresses, so the moving base cursor
+      // alone cannot prevent two images from mapping over one another. Reserve the complete
+      // image-plus-stubs range on pass 1 and reject any collision before publishing it.
+      if (assignBases) {
+        uint64_t rangeEnd = 0;
+        if (__builtin_add_overflow(e.loadBase, e.totalSize, &rangeEnd)) {
+          e.linked = false;
+          e.exports.clear();
+          e.failed = true;
+          e.error = e.path + ": mapped address range overflows";
+          base += opt.spacing;
+          continue;
+        }
+        auto collision = std::find_if(mappedRanges.begin(), mappedRanges.end(), [&](const MappedRange& r) {
+          return e.loadBase < r.end && r.begin < rangeEnd;
+        });
+        if (collision != mappedRanges.end()) {
+          e.linked = false;
+          e.exports.clear();
+          e.failed = true;
+          e.error = e.path + ": mapped address range overlaps " + entries_[collision->owner].path;
+          base += opt.spacing;
+          continue;
+        }
+        mappedRanges.push_back({e.loadBase, rangeEnd, idx});
+      }
+
       if (collect) {
         e.warnings.clear();
         for (const auto& w : e.linkedImage.warnings) e.warnings.push_back(w);
@@ -282,7 +315,9 @@ LoadResult Registry::linkAll(const Options& opt) {
         if (!e.executable && e.installName.empty())
           res.warnings.push_back(e.path + ": dylib has no LC_ID_DYLIB, so nothing can import from it by name");
       }
-      base += std::max(opt.spacing, alignUp(e.totalSize, pageSize));
+      // The cursor must clear the actual end of whatever was placed: fixed-placement classic
+      // images can sit far below the moving base, and totalSize can exceed spacing.
+      base = std::max(base + opt.spacing, alignUp(e.loadBase + e.totalSize, pageSize));
     }
   };
 

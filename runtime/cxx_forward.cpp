@@ -980,4 +980,260 @@ size_t HostCxxResolver::cachedHits() const {
   return n;
 }
 
+// --- libstdc++.6.dylib forwarding (Apple's pre-libc++ C++ runtime) -------------------------
+//
+// 2009-era ARMv6 apps (Touch & Go, JellyCar) were built against Apple's libstdc++.6.dylib,
+// not libc++. Their std::map/set call three libstdc++-internal red-black-tree helpers whose
+// Itanium mangling carries no std::__1 namespace. The _Rb_tree_node_base layout is stable
+// across every libstdc++ this project targets: an int color (0 red / 1 black) followed by
+// parent/left/right pointers -- 16 bytes in a 32-bit process, 32 in a 64-bit one. These
+// implementations only ever run in an ABI-matched process (the project's core doctrine),
+// where the host struct layout is byte-identical to the guest's.
+//
+// Exception machinery (___gxx_personality_sj0, __Unwind_SjLj_Resume, the __ZSt*__throw_*
+// helpers) stays unregistered on purpose -- see the doctrine comment in cxx_forward.h. The
+// only exception: SjLj context registration is inert bookkeeping (it links a buffer into a
+// chain that is only ever walked while unwinding), so no-op shims are safe and keep guest
+// static initializers alive.
+namespace {
+
+struct RbNodeBase {
+  int color;  // 0 = red, 1 = black (_Rb_tree_color under the Itanium ABI)
+  RbNodeBase *parent, *left, *right;
+};
+
+void rbRotateLeft(RbNodeBase* x, RbNodeBase*& root) {
+  RbNodeBase* y = x->right;
+  x->right = y->left;
+  if (y->left) y->left->parent = x;
+  y->parent = x->parent;
+  if (x == root) root = y;
+  else if (x == x->parent->left) x->parent->left = y;
+  else x->parent->right = y;
+  y->left = x;
+  x->parent = y;
+}
+
+void rbRotateRight(RbNodeBase* x, RbNodeBase*& root) {
+  RbNodeBase* y = x->left;
+  x->left = y->right;
+  if (y->right) y->right->parent = x;
+  y->parent = x->parent;
+  if (x == root) root = y;
+  else if (x == x->parent->right) x->parent->right = y;
+  else x->parent->left = y;
+  y->right = x;
+  x->parent = y;
+}
+
+RbNodeBase* rbMinimum(RbNodeBase* x) { while (x->left) x = x->left; return x; }
+RbNodeBase* rbMaximum(RbNodeBase* x) { while (x->right) x = x->right; return x; }
+
+// _Rb_tree_insert_and_rebalance(const bool, _Rb_tree_node_base*, _Rb_tree_node_base*,
+//                               _Rb_tree_node_base&) -- header is the end node: parent = root,
+// left = leftmost, right = rightmost.
+void rbInsertAndRebalance(bool insertLeft, RbNodeBase* x, RbNodeBase* p, RbNodeBase& header) {
+  RbNodeBase*& root = header.parent;
+  RbNodeBase*& leftmost = header.left;
+  RbNodeBase*& rightmost = header.right;
+  x->parent = p;
+  x->left = x->right = nullptr;
+  x->color = 0;  // red
+  if (insertLeft) {
+    p->left = x;
+    if (p == &header) { root = x; rightmost = x; }
+    else if (p == leftmost) leftmost = x;
+  } else {
+    p->right = x;
+    if (p == rightmost) rightmost = x;
+  }
+  while (x != root && x->parent->color == 0) {
+    RbNodeBase* xpp = x->parent->parent;
+    if (x->parent == xpp->left) {
+      RbNodeBase* y = xpp->right;
+      if (y && y->color == 0) {
+        x->parent->color = 1;
+        y->color = 1;
+        xpp->color = 0;
+        x = xpp;
+      } else {
+        if (x == x->parent->right) { x = x->parent; rbRotateLeft(x, root); }
+        x->parent->color = 1;
+        xpp->color = 0;
+        rbRotateRight(xpp, root);
+      }
+    } else {
+      RbNodeBase* y = xpp->left;
+      if (y && y->color == 0) {
+        x->parent->color = 1;
+        y->color = 1;
+        xpp->color = 0;
+        x = xpp;
+      } else {
+        if (x == x->parent->left) { x = x->parent; rbRotateRight(x, root); }
+        x->parent->color = 1;
+        xpp->color = 0;
+        rbRotateLeft(xpp, root);
+      }
+    }
+  }
+  root->color = 1;
+}
+
+// _Rb_tree_increment(_Rb_tree_node_base*) -- in-order successor.
+RbNodeBase* rbIncrement(RbNodeBase* x) {
+  if (!x) return x;
+  if (x->right) {
+    x = x->right;
+    while (x->left) x = x->left;
+  } else {
+    RbNodeBase* y = x->parent;
+    while (x == y->right) { x = y; y = y->parent; }
+    if (x->right != y) x = y;
+  }
+  return x;
+}
+
+// _Rb_tree_rebalance_for_erase(_Rb_tree_node_base*, _Rb_tree_node_base&) -- returns the node
+// whose payload replaced the erased node's (the successor), exactly like libstdc++.
+RbNodeBase* rbRebalanceForErase(RbNodeBase* z, RbNodeBase& header) {
+  RbNodeBase*& root = header.parent;
+  RbNodeBase*& leftmost = header.left;
+  RbNodeBase*& rightmost = header.right;
+  RbNodeBase* y = z;
+  RbNodeBase* x = nullptr;
+  RbNodeBase* xParent = nullptr;
+  if (!y->left) x = y->right;
+  else if (!y->right) x = y->left;
+  else { y = y->right; while (y->left) y = y->left; x = y->right; }
+  if (y != z) {
+    z->left->parent = y;
+    y->left = z->left;
+    if (y != z->right) {
+      xParent = y->parent;
+      if (x) x->parent = y->parent;
+      y->parent->left = x;
+      y->right = z->right;
+      z->right->parent = y;
+    } else {
+      xParent = y;
+    }
+    if (root == z) root = y;
+    else if (z->parent->left == z) z->parent->left = y;
+    else z->parent->right = y;
+    y->parent = z->parent;
+    std::swap(y->color, z->color);
+    y = z;
+  } else {
+    xParent = y->parent;
+    if (x) x->parent = y->parent;
+    if (root == z) root = x;
+    else if (z->parent->left == z) z->parent->left = x;
+    else z->parent->right = x;
+    if (leftmost == z) {
+      if (!z->right) leftmost = z->parent;
+      else leftmost = rbMinimum(x);
+    }
+    if (rightmost == z) {
+      if (!z->left) rightmost = z->parent;
+      else rightmost = rbMaximum(x);
+    }
+  }
+  if (y->color != 0) {
+    if (x) x->color = 1;
+    else {
+      // x is a hole (nullptr): rebalance by rank using xParent as its stand-in, mirroring
+      // libstdc++'s erase fixup which tolerates a null deletion victim.
+      while (x != root) {
+        if (!xParent) break;
+        if (x == xParent->left) {
+          RbNodeBase* w = xParent->right;
+          if (w && w->color == 0) {
+            w->color = 1;
+            xParent->color = 0;
+            rbRotateLeft(xParent, root);
+            w = xParent->right;
+          }
+          if (!w) break;
+          if ((!w->left || w->left->color == 1) && (!w->right || w->right->color == 1)) {
+            w->color = 0;
+            x = xParent;
+            xParent = xParent->parent;
+            continue;
+          }
+          if (!w->right || w->right->color == 1) {
+            if (w->left) w->left->color = 1;
+            w->color = 0;
+            rbRotateRight(w, root);
+            w = xParent->right;
+          }
+          w->color = xParent->color;
+          xParent->color = 1;
+          if (w->right) w->right->color = 1;
+          rbRotateLeft(xParent, root);
+          break;
+        } else {
+          RbNodeBase* w = xParent->left;
+          if (w && w->color == 0) {
+            w->color = 1;
+            xParent->color = 0;
+            rbRotateRight(xParent, root);
+            w = xParent->left;
+          }
+          if (!w) break;
+          if ((!w->right || w->right->color == 1) && (!w->left || w->left->color == 1)) {
+            w->color = 0;
+            x = xParent;
+            xParent = xParent->parent;
+            continue;
+          }
+          if (!w->left || w->left->color == 1) {
+            if (w->right) w->right->color = 1;
+            w->color = 0;
+            rbRotateLeft(w, root);
+            w = xParent->left;
+          }
+          w->color = xParent->color;
+          xParent->color = 1;
+          if (w->left) w->left->color = 1;
+          rbRotateRight(xParent, root);
+          break;
+        }
+      }
+      if (x) x->color = 1;
+    }
+  }
+  return y;
+}
+
+}  // namespace
+
+// SjLj bookkeeping no-ops: registering an unwind context only links a setjmp buffer into a
+// chain; if no exception is ever thrown, doing nothing is indistinguishable from doing it.
+void sjljRegisterNoop(void*) {}
+void sjljUnregisterNoop(void*) {}
+
+void addLibStdCxxForwarding(relinker::CompatRegistry& reg) {
+  auto add = [&](const char* mangled, void* fn, const char* what) {
+    reg.add(mangled, reinterpret_cast<uint64_t>(fn),
+            {compat::SymbolClass::CompatibilityShim, "libstdc++", what});
+  };
+  add("__ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_",
+      reinterpret_cast<void*>(rbInsertAndRebalance), "_Rb_tree_insert_and_rebalance");
+  add("__ZSt18_Rb_tree_incrementPSt18_Rb_tree_node_base",
+      reinterpret_cast<void*>(rbIncrement), "_Rb_tree_increment");
+  // The const overload shares the algorithm; Apple's headers instantiate it separately.
+  add("__ZSt18_Rb_tree_incrementPKSt18_Rb_tree_node_base",
+      reinterpret_cast<void*>(rbIncrement), "_Rb_tree_increment (const)");
+  add("__ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_",
+      reinterpret_cast<void*>(rbRebalanceForErase), "_Rb_tree_rebalance_for_erase");
+  // Inert SjLj context bookkeeping (see the comment above): real no-op functions, because
+  // the guest calls these as code. SjLj_Resume and the SJLJ personality stay unregistered
+  // so the named trap stubs report any actual throw.
+  reg.add("__Unwind_SjLj_Register", reinterpret_cast<uint64_t>(sjljRegisterNoop),
+          {compat::SymbolClass::CompatibilityShim, "libstdc++", "_Unwind_SjLj_Register (no-op)"});
+  reg.add("__Unwind_SjLj_Unregister", reinterpret_cast<uint64_t>(sjljUnregisterNoop),
+          {compat::SymbolClass::CompatibilityShim, "libstdc++", "_Unwind_SjLj_Unregister (no-op)"});
+}
+
 }  // namespace radeki::runtime

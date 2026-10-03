@@ -226,6 +226,52 @@ void parseBindOpcodes(Image& img, ImportTable& imports, const Reader& r, uint32_
     }
   }
 }
+// Classic (pre-dyld-info) binding. Older images carry no rebase/bind opcodes: dyld 1 loaded
+// them at their preferred vmaddr (slide 0) and the only external fixups are the
+// __nl_symbol_ptr / __la_symbol_ptr slots, each resolving through the section's range of the
+// indirect symbol table. __symbol_stub code reads those same lazy slots, so stub calls are
+// covered by binding the slots alone.
+void synthesizeClassicBinds(Image& img, ImportTable& imports) {
+  img.classicBinds = true;
+  const uint64_t ps = img.ptrSize();
+  std::map<uint32_t, uint32_t> importForSymbol;  // symtab index -> import index
+  for (const auto& s : img.segments)
+    for (const auto& x : s.sections) {
+      const uint32_t t = x.type();
+      if (t != S_NON_LAZY_SYMBOL_POINTERS && t != S_LAZY_SYMBOL_POINTERS) continue;
+      if (x.size % ps != 0) throw FormatError("symbol pointer section size is not pointer-aligned");
+      const uint64_t n = x.size / ps;
+      if (x.reserved1 > img.indirectSymbols.size() ||
+          n > img.indirectSymbols.size() - x.reserved1)
+        throw FormatError("symbol pointer section exceeds indirect symbol table");
+      for (uint64_t i = 0; i < n; ++i) {
+        const size_t e = size_t(x.reserved1) + size_t(i);
+        const uint32_t symIdx = img.indirectSymbols[e];
+        if (symIdx & (INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL)) continue;  // absolute/local markers
+        if (symIdx >= img.symbols.size()) throw FormatError("indirect symbol index outside symbol table");
+        const Symbol& sym = img.symbols[symIdx];
+        if (sym.stab() || !sym.external() || !sym.undefined()) continue;  // bound to self image
+        uint32_t imp;
+        auto it = importForSymbol.find(symIdx);
+        if (it == importForSymbol.end()) {
+          // The library ordinal occupies the high byte of n_desc; values 0xFF..0xFC
+          // encode the signed special ordinals (-1..-4), just like dyld bind opcodes.
+          const uint8_t raw = static_cast<uint8_t>(sym.libOrdinal());
+          const int ordinal = raw < 0x80 ? static_cast<int>(raw) : static_cast<int>(raw) - 0x100;
+          const bool weak = (sym.desc & 0x0040) != 0;  // N_WEAK_REF
+          imp = imports.get(sym.name, ordinal, weak);
+          importForSymbol.emplace(symIdx, imp);
+        } else imp = it->second;
+        checkFixupBudget(img);
+        Fixup f;
+        f.kind = Fixup::Kind::Bind;
+        f.addr = x.addr + i * ps;
+        f.importIndex = imp;
+        f.lazy = t == S_LAZY_SYMBOL_POINTERS;
+        img.fixups.push_back(f);
+      }
+    }
+}
 
 void parseChainedFixups(Image& img, ImportTable& table, const Reader& r, uint32_t off, uint32_t size) {
   Reader c = r.sub(off, size, "chained fixups");
@@ -469,7 +515,7 @@ std::vector<SliceInfo> listSlices(Bytes file) {
 }
 
 SliceChoice chooseSlice(const std::vector<SliceInfo>& slices) {
-  static const Arch order[] = {Arch::ARM64, Arch::ARM64e, Arch::ARMv7, Arch::ARMv7s, Arch::ARMv7k};
+  static const Arch order[] = {Arch::ARM64, Arch::ARM64e, Arch::ARMv7, Arch::ARMv7s, Arch::ARMv7k, Arch::ARMv6};
   for (Arch want : order)
     for (size_t i = 0; i < slices.size(); ++i)
       if (slices[i].arch == want && !slices[i].bigEndian) return {i, std::string("selected ") + archName(want)};
@@ -720,6 +766,7 @@ Image parseSlice(Bytes file, const SliceInfo& si) {
     for (uint32_t i = 0; i < pend.nindirect; ++i) img.indirectSymbols.push_back(r.read<uint32_t>(uint64_t(pend.indirectOff) + i * 4));
   }
 
+  if (!pend.haveDyldInfo && !pend.haveChained) synthesizeClassicBinds(img, importTable);
   if (pend.haveDyldInfo) {
     const uint32_t* d = pend.dyldInfo;
     if (d[1]) parseRebaseOpcodes(img, r, d[0], d[1]);
