@@ -22,7 +22,17 @@ jobs:
           cmake -S . -B build-android -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build-android
+      - name: Build ARM64 CLI
+        run: |
+          set -o pipefail
+          cmake --build build-android 2>&1 | tee "$RUNNER_TEMP/android-arm64-build.log"
+      - name: Report ARM64 build errors
+        if: failure()
+        run: |
+          grep -aA 4 -E 'error:|undefined reference|ld.lld: error|CMake Error|ninja: error' \
+            "$RUNNER_TEMP/android-arm64-build.log" | head -60 > "$RUNNER_TEMP/android-arm64-errors.txt" || true
+          test -s "$RUNNER_TEMP/android-arm64-errors.txt" || tail -40 "$RUNNER_TEMP/android-arm64-build.log" > "$RUNNER_TEMP/android-arm64-errors.txt"
+          while IFS= read -r line; do echo "::error::$line"; done < "$RUNNER_TEMP/android-arm64-errors.txt"
       - uses: actions/upload-artifact@v4
         with: { name: radeki-android-arm64, path: build-android/radeki }
   android-arm32:
@@ -34,7 +44,17 @@ jobs:
           cmake -S . -B build-android-arm32 -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build-android-arm32
+      - name: Build ARM32 CLI
+        run: |
+          set -o pipefail
+          cmake --build build-android-arm32 2>&1 | tee "$RUNNER_TEMP/android-arm32-build.log"
+      - name: Report ARM32 build errors
+        if: failure()
+        run: |
+          grep -aA 4 -E 'error:|undefined reference|ld.lld: error|CMake Error|ninja: error' \
+            "$RUNNER_TEMP/android-arm32-build.log" | head -60 > "$RUNNER_TEMP/android-arm32-errors.txt" || true
+          test -s "$RUNNER_TEMP/android-arm32-errors.txt" || tail -40 "$RUNNER_TEMP/android-arm32-build.log" > "$RUNNER_TEMP/android-arm32-errors.txt"
+          while IFS= read -r line; do echo "::error::$line"; done < "$RUNNER_TEMP/android-arm32-errors.txt"
       - uses: actions/upload-artifact@v4
         with: { name: radeki-android-arm32, path: build-android-arm32/radeki }
   apk:
