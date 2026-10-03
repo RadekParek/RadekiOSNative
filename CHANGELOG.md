@@ -3,6 +3,33 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - Restore the APK build (the workflow had lost its `apk` and `release` jobs)
+
+Host suite: **487 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
+
+- **Builds after `build-28` contained no APK.** Batch 6 extracted `RadekiOSNative.zip` into the
+  repository root and, together with the archive, restored the older workflow stored inside it,
+  so `.github/workflows/ci.yml` silently lost its `apk` and `release` jobs. Every run since
+  (PR #8, PR #9 and their `main` merges) built only the CLI binaries: the `RadekiOSNative-apk`
+  artifact was gone and no `build-<run number>` release was published.
+- Restored both jobs. The APK is assembled from the checked-out source tree
+  (`gradle -p android assembleDebug`) instead of from a second copy unpacked out of the archive,
+  so a release can no longer ship code older than the commit it is built from.
+- The APK is verified before it is uploaded and checked again before it is published: non-empty,
+  a valid zip, and containing `AndroidManifest.xml`, `classes.dex`, `resources.arsc` and
+  `lib/arm64-v8a/libradekijni.so`. An empty or partial artifact fails the job instead of becoming
+  a release asset.
+- Refreshed `RadekiOSNative.zip`. It still was the snapshot committed with PR #7 (identical
+  sha256), i.e. pre-batch-6 sources, and the `ci.yml` embedded in it was the workflow without the
+  APK jobs - extracting it again would re-introduce exactly this regression.
+  `tools/make_source_zip.sh` now rebuilds the archive from the tree (top-level `RadekiOSNative/`,
+  without `CHANGELOG.md` and without the archive itself), and the refreshed archive carries the
+  fixed workflow.
+- No C++ or Java source changed, and `host` / `android-arm64` are untouched. The APK is confirmed
+  by the CI `apk` job itself: no NDK/Android SDK is installed in the environment where this fix
+  was prepared, so the host suite and the APK verification steps (exercised here against
+  synthetic APKs, positive and negative) are all that could be run locally.
+
 ## 2026-10-03 - Android CLI link fix (missing liblog)
 
 Host suite: **487 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
@@ -234,10 +261,12 @@ Test suite: **213 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UB
 
 ## Channel notes
 
-- The artifact is `RadekiOSNative.zip` in the repository root; everything under it is the
-  project source tree.
-- Chronology of a change: edit the source tree → re-zip → commit → CI (`build`) unzips, runs
-  `make -C RadekiOSNative SAN=1 test`, builds `assembleDebug` and publishes
-  `RadekiOSNative.apk` as release `build-<run number>`.
+- The repository tree is canonical; `RadekiOSNative.zip` in the repository root is a mirror of
+  it (top-level `RadekiOSNative/`, rebuilt with `tools/make_source_zip.sh`). `CHANGELOG.md` lives
+  beside the archive, not inside it.
+- Chronology of a change: edit the source tree → `tools/make_source_zip.sh` → commit → CI
+  (`build`) runs the host suite, cross-builds the arm64-v8a CLI, assembles `assembleDebug` from
+  the checkout, verifies the APK and - on `main` - publishes `RadekiOSNative.apk` as release
+  `build-<run number>`.
 - A change is only listed here once the host test suite passes; claims that need hardware are
   marked as such in `progress.json` and `capabilities.json`.

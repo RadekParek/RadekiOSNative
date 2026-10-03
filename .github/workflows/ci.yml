@@ -1,5 +1,7 @@
 name: build
 on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
 jobs:
   host:
     runs-on: ubuntu-24.04
@@ -23,3 +25,58 @@ jobs:
       - run: cmake --build build-android
       - uses: actions/upload-artifact@v4
         with: { name: radeki-android-arm64, path: build-android/radeki }
+  apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      # The source tree in the checkout is canonical, so the APK is assembled from it directly:
+      # a stale RadekiOSNative.zip can no longer ship an APK that misses recent changes.
+      - name: Assemble arm64-v8a debug APK
+        run: gradle -p android assembleDebug --no-daemon --stacktrace --console=plain
+      - name: Stage and verify the APK
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk RadekiOSNative.apk
+          test -s RadekiOSNative.apk
+          unzip -t RadekiOSNative.apk >/dev/null
+          unzip -l RadekiOSNative.apk > "$RUNNER_TEMP/apk-entries.txt"
+          for entry in AndroidManifest.xml classes.dex resources.arsc lib/arm64-v8a/libradekijni.so; do
+            grep -q " $entry\$" "$RUNNER_TEMP/apk-entries.txt" || { echo "APK is missing $entry"; exit 1; }
+          done
+          echo "Verified APK entries:"
+          grep -E ' AndroidManifest\.xml$| classes\.dex$| resources\.arsc$' "$RUNNER_TEMP/apk-entries.txt"
+          grep -E ' lib/arm64-v8a/' "$RUNNER_TEMP/apk-entries.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RadekiOSNative-apk
+          path: RadekiOSNative.apk
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: apk
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: RadekiOSNative-apk
+      - name: Re-check the downloaded APK
+        run: |
+          test -s RadekiOSNative.apk
+          unzip -t RadekiOSNative.apk >/dev/null
+          unzip -l RadekiOSNative.apk | grep -q " lib/arm64-v8a/libradekijni.so\$"
+      - name: Publish APK as a release (direct .apk download)
+        run: |
+          gh release create "build-${{ github.run_number }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Build ${{ github.run_number }}" \
+            --notes "Debug APK (arm64-v8a), built from ${{ github.sha }}." \
+            RadekiOSNative.apk
+        env:
+          GH_TOKEN: ${{ github.token }}
