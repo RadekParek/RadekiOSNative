@@ -1,0 +1,12 @@
+<resources>
+    <color name="background">#050608</color>
+    <color name="surface">#12161C</color>
+    <color name="text">#E8EAED</color>
+    <color name="dim">#9AA3AD</color>
+    <color name="accent">#4F8CFF</color>
+    <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/background</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:textColorPrimary">@color/text</item>
+    </style>
+</resources>

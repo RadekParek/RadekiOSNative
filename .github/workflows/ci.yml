@@ -1,50 +1,25 @@
 name: build
 on: [push, pull_request, workflow_dispatch]
-permissions:
-  contents: read
 jobs:
   host:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - run: unzip -q RadekiOSNative.zip
-      - run: make -C RadekiOSNative SAN=1 test
-  apk:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - run: unzip -q RadekiOSNative.zip
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
-      - name: Assemble ARM64 debug APK
-        run: gradle -p RadekiOSNative/android assembleDebug --no-daemon --stacktrace --console=plain
-      - name: Stage and verify APK
-        run: |
-          cp RadekiOSNative/android/app/build/outputs/apk/debug/app-debug.apk RadekiOSNative.apk
-          test -s RadekiOSNative.apk
-          unzip -t RadekiOSNative.apk >/dev/null
-          unzip -l RadekiOSNative.apk > "$RUNNER_TEMP/apk-entries.txt"
-          grep 'lib/arm64-v8a/libradekijni.so' "$RUNNER_TEMP/apk-entries.txt"
+      - uses: actions/checkout@v4
+      - name: Tests (sanitizers)
+        run: make SAN=1 test
+      - name: Release build
+        run: make clean && make -j4 && make test
       - uses: actions/upload-artifact@v4
-        with:
-          name: RadekiOSNative-apk
-          path: RadekiOSNative.apk
-  release:
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: apk
+        with: { name: radeki-linux-x86_64, path: build/radeki }
+  android-arm64:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: RadekiOSNative-apk
-      - name: Publish APK as a release (direct .apk download)
-        run: gh release create "build-${{ github.run_number }}" RadekiOSNative.apk --repo "$GITHUB_REPOSITORY" --title "Build ${{ github.run_number }}" --notes "Debug APK"
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v4
+      - name: Configure (NDK, arm64-v8a)
+        run: |
+          cmake -S . -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-android
+      - uses: actions/upload-artifact@v4
+        with: { name: radeki-android-arm64, path: build-android/radeki }
