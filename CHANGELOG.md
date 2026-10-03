@@ -24,6 +24,10 @@ and execution on an ARM64 device were **not** verified in this environment.
   library, staged SAF IPA extraction, native metadata/analysis JSON, crash logs and dialog.
   Java/Gradle/NDK compilation and real IPA compatibility still require device/toolchain checks.
 
+### Follow-up hardening
+- Bundle icon selection now resolves declared @2x/@3x/~ipad renditions and rejects icons symlinked outside the imported .app.
+- Android re-import preserves the prior bundle and icon until replacement inspection and library storage complete; library writes use AtomicFile.
+
 ## 2026-10-03 - multi-image loading and Objective-C metadata reading
 
 Test suite: **213 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
