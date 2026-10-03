@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cstdarg>
+#include <cstdint>
 #include <deque>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -411,6 +413,93 @@ int c_puts(const char* s) {
   return 1;
 }
 int c_putchar(int c) { appendGuestOutput(std::string(1, char(c))); return c; }
+
+// --- batch 4: Touch & Go / pre-libc++ armv6 support ----------------------------------------
+//
+// Everything here either forwards to an identical host C library function (same semantics,
+// same AAPCS32 calling convention under the hard-float VFP ABI the guest uses) or implements
+// a small algorithm exactly once and documents its limits.
+
+// libgcc division builtins, legacy interface (quotient in r0, remainder in r0 for mod).
+// Apple's libgcc exported these under the pre-EABI names; the EABI __aeabi_* wrappers the
+// compiler emits at call sites were already folded into the guest at build time.
+// Division by zero is not a fault here: the ARM sdiv/udiv instruction yields quotient 0 and
+// remainder = dividend, and the generic libgcc long-division loop produces the same values.
+// Matching that keeps a buggy guest computing instead of aborting the whole process.
+int32_t c_divsi3(int32_t a, int32_t b) {
+  if (!b) return 0;
+  if (a == INT32_MIN && b == -1) return a;  // overflow wraps, matching the hardware
+  return a / b;
+}
+uint32_t c_udivsi3(uint32_t a, uint32_t b) {
+  return b ? a / b : 0;
+}
+int32_t c_modsi3(int32_t a, int32_t b) {
+  if (!b) return a;
+  if (a == INT32_MIN && b == -1) return 0;
+  return a % b;
+}
+uint32_t c_umodsi3(uint32_t a, uint32_t b) {
+  return b ? a % b : a;
+}
+
+// Variadic C functions: AAPCS32 passes varargs core arguments in r0-r3 then on the stack, and
+// the guest was compiled with the same convention, so the host printf/sprintf can consume the
+// guest's argument area directly. (On-device this is only exercised through the ARM32 edition.)
+int c_printf(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  char stack[4096];
+  int n = std::vsnprintf(stack, sizeof stack, fmt ? fmt : "(null)", ap);
+  va_end(ap);
+  appendGuestOutput(std::string(stack, size_t(n < 0 ? 0 : std::min(size_t(n), sizeof stack - 1))));
+  return n;
+}
+int c_sprintf(char* out, const char* fmt, ...) {
+  if (!out) return -1;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = std::vsnprintf(out, 8192, fmt ? fmt : "(null)", ap);  // guest buffer length is unknown
+  va_end(ap);                                                   // to the shim; callers of 2009-era
+  return n;                                                     // sprintf always sized generously
+}
+
+// Darwin's __assert_rtn prints and aborts -- same semantics here, captured into the run log.
+void c_assert_rtn(const char* func, const char* file, int line, const char* expr) {
+  noteCompatCall("__assert_rtn");
+  std::string msg = "assertion failed";
+  if (expr && *expr) msg += std::string(": ") + expr;
+  if (func && *func) msg += std::string(" (function ") + func + ")";
+  if (file && *file) msg += std::string(" [") + file + ":" + std::to_string(line) + "]";
+  appendGuestOutput(msg + "\n");
+  abortGuest(134, "__assert_rtn");
+}
+
+// pthread_attr_* only ever configure detached state/scope, which c_pthread_create ignores by
+// documented policy ("Apple's pthread_attr_t layout is ignored"), so returning success without
+// touching the guest's attribute buffer is consistent with that policy, and honest: the log
+// records every call.
+int c_pthread_attr_init(void*) { noteCompatCall("pthread_attr_init"); return 0; }
+int c_pthread_attr_destroy(void*) { noteCompatCall("pthread_attr_destroy"); return 0; }
+int c_pthread_attr_setdetachstate(void*, int) { noteCompatCall("pthread_attr_setdetachstate"); return 0; }
+
+// pthread_mach_thread_np returns a Mach thread port. Nothing in this process can honor Mach
+// ports; the pthread identity is the closest truthful unique-per-thread handle, and
+// thread_policy_set (the usual consumer) is refused below.
+uintptr_t c_pthread_mach_thread_np(uintptr_t) { return static_cast<uintptr_t>(pthread_self()); }
+
+// Mach thread-policy calls are advisory scheduling hints. KERN_SUCCESS (0) would silently
+// pretend the host honored them; instead report the Mach error for "policy not supported".
+constexpr int kKernInvalidTask = 16;      // xnu KERN_INVALID_TASK
+constexpr int kKernInvalidPolicy = 28;    // xnu KERN_INVALID_POLICY
+int c_thread_policy_set(uintptr_t, int, const void*, int) {
+  noteCompatCall("thread_policy_set");
+  return kKernInvalidPolicy;
+}
+int c_thread_info(uintptr_t, int, void*, unsigned*) {
+  noteCompatCall("thread_info");
+  return kKernInvalidTask;
+}
 void c_exit(int code) { finalizeCxx(nullptr); abortGuest(code, nullptr); }
 void c_immediate_exit(int code) { abortGuest(code, nullptr); }
 void c_abort() { abortGuest(134, "abort() called"); }
@@ -1075,6 +1164,49 @@ relinker::CompatRegistry makeCompatRegistry() {
   r.add("_ceil", addr(static_cast<double (*)(double)>(&std::ceil)));
   r.add("_log", addr(static_cast<double (*)(double)>(&std::log)));
   r.add("_exp", addr(static_cast<double (*)(double)>(&std::exp)));
+  r.add("_tan", addr(static_cast<double (*)(double)>(&std::tan)));
+  r.add("_asin", addr(static_cast<double (*)(double)>(&std::asin)));
+  r.add("_acos", addr(static_cast<double (*)(double)>(&std::acos)));
+  r.add("_atan", addr(static_cast<double (*)(double)>(&std::atan)));
+  r.add("_atan2", addr(static_cast<double (*)(double, double)>(&std::atan2)));
+  r.add("_log10", addr(static_cast<double (*)(double)>(&std::log10)));
+  // Float variants (GLES-era game math calls these directly; same AAPCS VFP conventions).
+  r.add("_sqrtf", addr(static_cast<float (*)(float)>(&std::sqrt)));
+  r.add("_powf", addr(static_cast<float (*)(float, float)>(&std::pow)));
+  r.add("_fmodf", addr(static_cast<float (*)(float, float)>(&std::fmod)));
+  r.add("_sinf", addr(static_cast<float (*)(float)>(&std::sin)));
+  r.add("_cosf", addr(static_cast<float (*)(float)>(&std::cos)));
+  r.add("_tanf", addr(static_cast<float (*)(float)>(&std::tan)));
+  r.add("_asinf", addr(static_cast<float (*)(float)>(&std::asin)));
+  r.add("_acosf", addr(static_cast<float (*)(float)>(&std::acos)));
+  r.add("_atanf", addr(static_cast<float (*)(float)>(&std::atan)));
+  r.add("_atan2f", addr(static_cast<float (*)(float, float)>(&std::atan2)));
+  r.add("_logf", addr(static_cast<float (*)(float)>(&std::log)));
+  r.add("_log10f", addr(static_cast<float (*)(float)>(&std::log10)));
+  r.add("_expf", addr(static_cast<float (*)(float)>(&std::exp)));
+  r.add("_floorf", addr(static_cast<float (*)(float)>(&std::floor)));
+  r.add("_ceilf", addr(static_cast<float (*)(float)>(&std::ceil)));
+  r.add("_fabsf", addr(static_cast<float (*)(float)>(&std::fabs)));
+  // libgcc builtins (pre-EABI names Apple's libgcc exported).
+  r.add("___divsi3", addr(c_divsi3));
+  r.add("___udivsi3", addr(c_udivsi3));
+  r.add("___modsi3", addr(c_modsi3));
+  r.add("___umodsi3", addr(c_umodsi3));
+  // libc / Darwin odds and ends.
+  r.add("_rand", addr(&std::rand));
+  r.add("_srand", addr(&std::srand));
+  r.add("_printf", addr(c_printf));
+  r.add("_sprintf", addr(c_sprintf));
+  r.add("___assert_rtn", addr(c_assert_rtn));
+  r.add("_pthread_attr_init", addr(c_pthread_attr_init));
+  r.add("_pthread_attr_destroy", addr(c_pthread_attr_destroy));
+  r.add("_pthread_attr_setdetachstate", addr(c_pthread_attr_setdetachstate));
+  r.add("_pthread_mach_thread_np", addr(c_pthread_mach_thread_np));
+  r.add("_thread_policy_set", addr(c_thread_policy_set));
+  r.add("_thread_info", addr(c_thread_info));
+  // libstdc++.6.dylib (Apple's pre-libc++ C++ runtime): red-black-tree helpers for
+  // std::map/set, plus inert SjLj unwind bookkeeping. Exceptions themselves stay unbound.
+  addLibStdCxxForwarding(r);
   addCxxCompat(r);
   // libc++.1.dylib -> host C++ runtime forwarding table (basic_string wrappers, ios_base::Init,
   // std::string::npos...). Deliberately NOT here: framework dummy classes/stubs (see

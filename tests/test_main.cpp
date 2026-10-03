@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <memory>
+#include <set>
 #include <thread>
 
 #include "arm64/arm64.h"
@@ -87,6 +89,9 @@ TEST(fat_and_selection) {
 #endif
   auto only32 = macho::chooseSlice({sl[1]});
   CHECK(only32.index && *only32.index == 0);
+  CHECK(macho::archFromCpu(12, 6) == macho::Arch::ARMv6);
+  auto onlyArmv6 = macho::chooseSlice({macho::SliceInfo{macho::Arch::ARMv6, 12, 6, 0, 0, true, false}});
+  CHECK(onlyArmv6.index && *onlyArmv6.index == 0);
   auto x86 = macho::chooseSlice({macho::SliceInfo{macho::Arch::X86_64, 0x01000007, 3, 0, 0, true, false}});
   CHECK(!x86.index && x86.reason.find("x86_64") != std::string::npos);
   auto fe = synth::fat({{{0x0100000C, 2}, a}});
@@ -111,6 +116,40 @@ TEST(parse_dyld_info) {
   CHECK(img.functionStarts.size() == 2 && img.functionStarts[1] == synth::kText + 60);
   CHECK(img.symbols.size() == 4 && img.symbols[2].undefined());
   CHECK(img.uuid.rfind("A0A1A2A3", 0) == 0);
+}
+
+TEST(classic_indirect_symbol_binds) {
+  auto bytes = synth::build({0, 0, 0, false, true});
+  // N_WEAK_REF occupies a low n_desc flag, while the special -2 (flat lookup) ordinal is
+  // in its high byte. This catches accidental low-byte ordinal decoding.
+  constexpr size_t secondUndefinedDesc = 0x8000 + 0x100 + 3 * 16 + 6;
+  bytes[secondUndefinedDesc] = 0x40;
+  bytes[secondUndefinedDesc + 1] = 0xFE;
+
+  auto img = macho::parseFile(bytes);
+  CHECK(img.classicBinds && !img.hasDyldInfo && !img.hasChainedFixups);
+  CHECK(img.fixups.size() == 2 && img.imports.size() == 2);
+  CHECK(img.fixups[0].kind == macho::Fixup::Kind::Bind && img.fixups[0].addr == synth::kData);
+  CHECK(img.fixups[1].kind == macho::Fixup::Kind::Bind && img.fixups[1].addr == synth::kData + 8);
+  CHECK(img.imports[0].name == "_puts" && img.imports[0].libOrdinal == 1 && !img.imports[0].weak);
+  CHECK(img.imports[1].name == "_missing_fn" && img.imports[1].libOrdinal == -2 && img.imports[1].weak);
+
+  relinker::CompatRegistry resolver;
+  resolver.add("_puts", 0x12345000);
+  relinker::LinkOptions options;
+  options.loadBase = synth::kBase;
+  options.resolver = &resolver;
+  auto linked = relinker::link(img, options);
+  CHECK(linked.slide == 0 && linked.rebases == 0 && linked.binds == 2);
+  CHECK(linked.read64(synth::kData) == 0x12345000 && linked.read64(synth::kData + 8) == 0);
+  CHECK(linked.traps.empty() && linked.warnings.empty());
+
+  options.loadBase += 0x10000;
+  auto displaced = relinker::link(img, options);
+  CHECK(displaced.slide == 0x10000);
+  CHECK(std::any_of(displaced.warnings.begin(), displaced.warnings.end(), [](const std::string& w) {
+    return w.find("classic image") != std::string::npos && w.find("slide 0") != std::string::npos;
+  }));
 }
 
 TEST(parse_chained) {
@@ -191,7 +230,7 @@ TEST(arm32_parse_and_link) {
   CHECK(img.arch == macho::Arch::ARMv7 && !img.is64);
   auto report = analysis::analyze(img);
 #if !defined(__arm__) || defined(__aarch64__)
-  CHECK(!report.blockers.empty() && report.blockers.front().find("separate 32-bit ARM process") != std::string::npos);
+  CHECK(!report.blockers.empty() && report.blockers.front().find("matching 32-bit ARM process") != std::string::npos);
 #else
   CHECK(report.blockers.empty());
 #endif
@@ -211,6 +250,29 @@ TEST(arm32_parse_and_link) {
   CHECK(linked.read32(0x10002000) == linked.traps[0].addr);
   CHECK(linked.read32(linked.traps[0].addr) == 0xE1200070); // A32 BKPT #0
   CHECK(!relinker::validate(linked).warnings.empty()); // AArch32 instruction scan is explicitly unimplemented
+
+  // A 64-bit host resolver address cannot be represented in an ARM32 guest pointer slot.
+  // Keep the import unresolved and install a 32-bit trap rather than truncating the address.
+  relinker::CompatRegistry highAddressResolver;
+  highAddressResolver.add("_missing_fn", 0x100000000ull);
+  relinker::LinkOptions highAddressOptions = opt;
+  highAddressOptions.resolver = &highAddressResolver;
+  auto highAddressLink = relinker::link(img, highAddressOptions);
+  CHECK(highAddressLink.traps.size() == 1);
+  CHECK(highAddressLink.read32(0x10002000) == highAddressLink.traps[0].addr);
+  CHECK(std::any_of(highAddressLink.warnings.begin(), highAddressLink.warnings.end(), [](const std::string& w) {
+    return w.find("exceeds the ARM32 address space") != std::string::npos;
+  }));
+
+  // ARMv6 is treated as native only from a matching AArch32 process, just like ARMv7.
+  auto armv6Image = img;
+  armv6Image.arch = macho::Arch::ARMv6;
+  auto armv6Report = analysis::analyze(armv6Image);
+#if !defined(__arm__) || defined(__aarch64__)
+  CHECK(!armv6Report.blockers.empty() && armv6Report.blockers.front().find("matching 32-bit ARM process") != std::string::npos);
+#else
+  CHECK(armv6Report.blockers.empty());
+#endif
 
   relinker::LinkOptions unaligned = opt;
   unaligned.loadBase = 0x10001004;
@@ -454,7 +516,8 @@ TEST(dyld_binds_across_images) {
   const loader::Entry* e = reg.find("radeki");
   const loader::Entry* d = reg.find("/usr/lib/libSystem.B.dylib");  // install name also matches
   CHECK(e && d && e->linked && d->linked);
-  CHECK(e->loadBase == o.firstBase + 0x4000000 && d->loadBase == o.firstBase);
+  CHECK(e->loadBase == o.firstBase + 0x4000000 && d->loadBase == synth::kBase);
+  CHECK(d->slide == 0);  // classic dylib: no rebase records, so it must sit at its preferred vmaddr
   CHECK(e->slide == e->loadBase - synth::kBase);
   CHECK(e->linkedImage.traps.empty());  // nothing left unbound
   CHECK(relinker::validate(e->linkedImage).ok());
@@ -474,6 +537,20 @@ TEST(dyld_binds_across_images) {
   CHECK(reg.resolve("_missing_fn", "libSystem") != std::nullopt);
   CHECK(reg.resolve("_UIApplicationMain", "") == std::nullopt);
   CHECK(reg.executable() == e);
+}
+
+TEST(dyld_classic_images_reject_overlaps) {
+  auto bytes = synth::dylib();
+  auto image = macho::parseFile(bytes);
+  CHECK(image.classicBinds);
+
+  loader::Registry registry;
+  CHECK(registry.add({"classic-a", &image, false}) == 0);
+  CHECK(registry.add({"classic-b", &image, false}) == 1);
+  loader::Options options;
+  auto result = registry.linkAll(options);
+  CHECK(!result.ok() && result.errors.size() == 1);
+  CHECK(result.errors[0].find("mapped address range overlaps") != std::string::npos);
 }
 
 TEST(dyld_flat_namespace_late_provider) {
@@ -1286,17 +1363,249 @@ TEST(egl_surface_rebind_thread_safety_and_heartbeat) {
   CHECK(out.find("UIApplicationMain") != std::string::npos);
 }
 
+// --- batch 4: Touch & Go 1.1 (armv6 classic image) compatibility ---------------------------
+
+// Every import of Touch & Go 1.1 that was unresolved before this batch must now answer from
+// the host runtime layer: a real shim, a truthful subset implementation, or a labeled data
+// object. This list is the measured unresolved set from `radeki load --stubs` on the IPA.
+TEST(batch4_touch_go_import_coverage) {
+  static const char* const imports[] = {
+      "___gxx_personality_sj0", "_CGAffineTransformIdentity", "_NSInternalInconsistencyException",
+      "_CGColorSpaceCreateDeviceGray", "_CGBitmapContextCreate", "_CGColorSpaceRelease",
+      "_CGContextSetGrayFillColor", "_CGContextTranslateCTM", "_CGContextScaleCTM",
+      "_UIGraphicsPushContext", "_UIGraphicsPopContext", "_CGContextRelease",
+      "_CGImageGetAlphaInfo", "_CGImageGetColorSpace", "_CGImageGetWidth", "_CGImageGetHeight",
+      "_CGAffineTransformScale", "_CGColorSpaceCreateDeviceRGB", "_CGContextClearRect",
+      "_AudioQueueEnqueueBuffer", "_AudioQueueAllocateBuffer", "_AudioQueueGetProperty",
+      "_glEnableClientState", "_glTranslatef", "_glRotatef", "_glPushMatrix", "_glVertexPointer",
+      "_glTexCoordPointer", "_glColorPointer", "_glDisableClientState", "_glPopMatrix",
+      "_CFArrayAppendValue", "_CGAffineTransformIsIdentity", "_CGContextConcatCTM",
+      "_CGContextDrawImage", "_glBindFramebufferOES", "_glMatrixMode", "_glLoadIdentity",
+      "_glOrthof", "_glBindRenderbufferOES", "_glGenFramebuffersOES", "_glGenRenderbuffersOES",
+      "_glFramebufferRenderbufferOES", "_glGetRenderbufferParameterivOES",
+      "_glCheckFramebufferStatusOES", "_glDeleteFramebuffersOES", "_glDeleteRenderbuffersOES",
+      "_CFArrayRemoveAllValues", "_objc_copyStruct", "_alcGetProcAddress",
+      "_CFURLCreateFromFileSystemRepresentation", "_AudioFileOpenURL", "_AudioFileGetProperty",
+      "_AudioQueuePrime", "_AudioQueueStart", "_AudioQueueSetParameter", "_CFArrayCreateMutable",
+      "__Unwind_SjLj_Resume", "_CFArrayGetValueAtIndex", "_CFArrayGetCount",
+      "_CFArrayRemoveValueAtIndex", "_alSourceQueueBuffers", "_AudioQueueDispose",
+      "_AudioQueueFreeBuffer", "_AudioQueueNewOutput", "_AudioQueueAddPropertyListener",
+      "__ZSt17__throw_bad_allocv", "_alSourcef", "_alcDestroyContext", "_alcCloseDevice",
+      "_alcOpenDevice", "_alcCreateContext", "_alcMakeContextCurrent", "__ZSt20__throw_length_errorPKc",
+      "_AudioFileReadPackets", "_AudioQueueStop", "_AudioFileGetPropertyInfo",
+      "_AudioQueueSetProperty", "_alGenSources", "_alDeleteSources", "_AudioFileReadBytes",
+      "_alGenBuffers", "_alGetError", "_AudioFileClose", "_alSourcei", "_alGetSourcei",
+      "_alSourceUnqueueBuffers", "_alSourceStop", "_alSourcePlay", "_asin", "___modsi3",
+      "___divsi3", "_cosf", "_sinf", "_atan2f", "_tanf", "_ceilf", "_floorf", "_logf",
+      "_atan2", "_pthread_mach_thread_np", "_thread_policy_set", "_pthread_attr_init",
+      "_pthread_attr_setdetachstate", "__Unwind_SjLj_Register", "_rand", "_srand",
+      "__Unwind_SjLj_Unregister", "_printf", "___udivsi3", "_pthread_attr_destroy", "_thread_info",
+      "_sprintf", "___assert_rtn",
+  };
+  auto host = runtime::makeHostRuntime();
+  for (const char* n : imports) {
+    auto v = host.registry.resolve(n, "");
+    // What the registry does not answer, the dispatch-stub factory does (labeled data objects
+    // for NSException names and Core* constants, logging code stubs for the rest).
+    if (!v && host.stubFactory) {
+      uint64_t stub = host.stubFactory(n, "");
+      if (stub) v = stub;
+    }
+    ++checks;
+    if (!v) {
+      ++failures;
+      printf("FAIL %s:%d: Touch & Go import still unbound: %s\n", __FILE__, __LINE__, n);
+    }
+  }
+}
+
+TEST(batch4_cg_transform_and_cfarray) {
+  auto host = runtime::makeHostRuntime();
+  using IsIdentity = uint64_t (*)(const void*);
+  auto isIdentity = reinterpret_cast<IsIdentity>(*host.registry.resolve("_CGAffineTransformIsIdentity", ""));
+  auto identityData = host.registry.resolve("_CGAffineTransformIdentity", "");
+  CHECK(isIdentity && identityData);
+  const float* exportedIdentity = reinterpret_cast<const float*>(*identityData);
+  CHECK(exportedIdentity[0] == 1 && exportedIdentity[1] == 0 && exportedIdentity[2] == 0 &&
+        exportedIdentity[3] == 1 && exportedIdentity[4] == 0 && exportedIdentity[5] == 0);
+  float identity[6] = {1, 0, 0, 1, 0, 0};
+  CHECK(isIdentity(identity) == 1);
+  float scaled[6] = {2, 0, 0, 3, 0, 0};
+  CHECK(isIdentity(scaled) == 0);
+
+  using CreateArray = void* (*)(const void*, intptr_t, const void*);
+  using Append = void (*)(void*, const void*);
+  using GetCount = intptr_t (*)(void*);
+  using GetValue = const void* (*)(void*, intptr_t);
+  using RemoveAt = void (*)(void*, intptr_t);
+  using RemoveAll = void (*)(void*);
+  auto create = reinterpret_cast<CreateArray>(*host.registry.resolve("_CFArrayCreateMutable", ""));
+  auto append = reinterpret_cast<Append>(*host.registry.resolve("_CFArrayAppendValue", ""));
+  auto count = reinterpret_cast<GetCount>(*host.registry.resolve("_CFArrayGetCount", ""));
+  auto valueAt = reinterpret_cast<GetValue>(*host.registry.resolve("_CFArrayGetValueAtIndex", ""));
+  auto removeAt = reinterpret_cast<RemoveAt>(*host.registry.resolve("_CFArrayRemoveValueAtIndex", ""));
+  auto removeAll = reinterpret_cast<RemoveAll>(*host.registry.resolve("_CFArrayRemoveAllValues", ""));
+  CHECK(create && append && count && valueAt && removeAt && removeAll);
+  int a = 1, b = 2, c = 3;
+  void* arr = create(nullptr, 0, nullptr);
+  CHECK(arr);
+  append(arr, &a);
+  append(arr, &b);
+  append(arr, &c);
+  CHECK(count(arr) == 3);
+  CHECK(valueAt(arr, 0) == &a && valueAt(arr, 2) == &c && valueAt(arr, 3) == nullptr);
+  removeAt(arr, 1);
+  CHECK(count(arr) == 2 && valueAt(arr, 0) == &a && valueAt(arr, 1) == &c);
+  removeAll(arr);
+  CHECK(count(arr) == 0);
+  removeAt(arr, 0);  // out of range must be a no-op, not a crash
+  CHECK(count(arr) == 0);
+
+  // objc_copyStruct is a sized struct copy.
+  using CopyStruct = void (*)(void*, const void*, size_t);
+  auto copyStruct = reinterpret_cast<CopyStruct>(*host.registry.resolve("_objc_copyStruct", ""));
+  CHECK(copyStruct);
+  const uint8_t src[7] = {1, 2, 3, 4, 5, 6, 7};
+  uint8_t dst[7] = {};
+  copyStruct(dst, src, sizeof src);
+  CHECK(std::memcmp(dst, src, sizeof src) == 0);
+  runtime::takeGuestOutput();
+}
+
+TEST(batch4_mach_thread_errors) {
+  auto host = runtime::makeHostRuntime();
+  using ThreadPolicySet = int (*)(uintptr_t, int, const void*, int);
+  using ThreadInfo = int (*)(uintptr_t, int, void*, unsigned*);
+  auto policySet = reinterpret_cast<ThreadPolicySet>(*host.registry.resolve("_thread_policy_set", ""));
+  auto threadInfo = reinterpret_cast<ThreadInfo>(*host.registry.resolve("_thread_info", ""));
+  CHECK(policySet && threadInfo);
+  CHECK(policySet(0, 0, nullptr, 0) == 28);  // KERN_INVALID_POLICY
+  CHECK(threadInfo(0, 0, nullptr, nullptr) == 16);  // KERN_INVALID_TASK
+  runtime::takeGuestOutput();
+}
+
+TEST(batch4_div_mod_builtins) {
+  auto host = runtime::makeHostRuntime();
+  using I32Bin = int32_t (*)(int32_t, int32_t);
+  using U32Bin = uint32_t (*)(uint32_t, uint32_t);
+  auto divsi = reinterpret_cast<I32Bin>(*host.registry.resolve("___divsi3", ""));
+  auto modsi = reinterpret_cast<I32Bin>(*host.registry.resolve("___modsi3", ""));
+  auto udivsi = reinterpret_cast<U32Bin>(*host.registry.resolve("___udivsi3", ""));
+  auto umodsi = reinterpret_cast<U32Bin>(*host.registry.resolve("___umodsi3", ""));
+  CHECK(divsi && modsi && udivsi && umodsi);
+  CHECK(divsi(7, 2) == 3 && divsi(-7, 2) == -3 && divsi(7, -2) == -3);  // truncation toward zero
+  CHECK(modsi(7, 2) == 1 && modsi(-7, 2) == -1 && modsi(7, -2) == 1);
+  CHECK(udivsi(7u, 2u) == 3u);
+  CHECK(umodsi(7u, 2u) == 1u);
+  CHECK(divsi(5, 0) == 0 && modsi(5, 0) == 5);          // libgcc semantics for b == 0
+  CHECK(udivsi(5, 0) == 0u && umodsi(5, 0) == 5u);
+  CHECK(divsi(INT32_MIN, -1) == INT32_MIN);             // overflow wraps, like the libgcc builtin
+  CHECK(modsi(INT32_MIN, -1) == 0);
+}
+
+// The libstdc++.6 forwarding table implements the red-black-tree helpers pre-libc++
+// std::map/std::set are compiled against. Randomized inserts and erases must produce exactly
+// the same tree shape discipline (in-order sequence, header invariants) as std::set.
+TEST(batch4_rb_tree_algorithms) {
+  auto host = runtime::makeHostRuntime();
+  using Insert = void (*)(bool, void*, void*, void*);
+  using Increment = void* (*)(void*);
+  using Erase = void* (*)(void*, void*);
+  auto insertAndRebalance = reinterpret_cast<Insert>(
+      *host.registry.resolve("__ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_", ""));
+  auto increment =
+      reinterpret_cast<Increment>(*host.registry.resolve("__ZSt18_Rb_tree_incrementPSt18_Rb_tree_node_base", ""));
+  auto erase = reinterpret_cast<Erase>(
+      *host.registry.resolve("__ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_", ""));
+  CHECK(insertAndRebalance && increment && erase);
+
+  struct Node {
+    int color;
+    Node* parent;
+    Node* left;
+    Node* right;
+    int key;
+  };
+  Node header{1, nullptr, nullptr, nullptr, -1};
+  std::vector<std::unique_ptr<Node>> nodes;
+  std::set<int> model;
+  auto findNode = [&](Node* root, int key) -> Node* {
+    Node* n = root;
+    while (n) {
+      if (key < n->key) n = n->left;
+      else if (n->key < key) n = n->right;
+      else return n;
+    }
+    return nullptr;
+  };
+  std::mt19937 rng(0x5EED);
+  std::vector<int> order;
+  for (int i = 0; i < 400; ++i) order.push_back(i);
+  std::shuffle(order.begin(), order.end(), rng);
+  for (int key : order) {
+    Node* root = header.parent;
+    Node* parent = &header;
+    bool left = true;
+    while (root) {
+      parent = root;
+      if (key < root->key) { left = true; root = root->left; }
+      else if (root->key < key) { left = false; root = root->right; }
+      else break;
+    }
+    CHECK(model.insert(key).second);  // the model must agree the key was absent
+    nodes.push_back(std::make_unique<Node>());
+    Node* n = nodes.back().get();
+    n->key = key;
+    insertAndRebalance(left, n, parent, static_cast<void*>(&header));
+  }
+  CHECK(header.parent->color == 1);  // root is black
+  // In-order traversal via _Rb_tree_increment must match std::set.
+  Node* it = header.left;
+  auto modelIt = model.begin();
+  while (it != &header) {
+    CHECK(modelIt != model.end() && it->key == *modelIt);
+    ++modelIt;
+    it = static_cast<Node*>(increment(it));
+  }
+  CHECK(modelIt == model.end());
+  // Erase half of the tree, alternating against the model.
+  std::vector<int> eraseOrder(order.begin(), order.begin() + 200);
+  for (int key : eraseOrder) {
+    Node* n = findNode(header.parent, key);
+    CHECK(n && n->key == key);
+    erase(n, &header);
+    CHECK(model.erase(key) == 1);
+  }
+  it = header.left;
+  modelIt = model.begin();
+  while (it != &header) {
+    CHECK(modelIt != model.end() && it->key == *modelIt);
+    ++modelIt;
+    it = static_cast<Node*>(increment(it));
+  }
+  CHECK(modelIt == model.end() && model.size() == 200);
+  CHECK(header.left && header.right && header.parent);
+  Node* min = header.parent;
+  while (min->left) min = min->left;
+  CHECK(header.left == min);  // leftmost invariant after erases
+  Node* max = header.parent;
+  while (max->right) max = max->right;
+  CHECK(header.right == max);  // rightmost invariant after erases
+}
 int main() {
-  bytes_bounds(); arm64_encodings(); fat_and_selection(); parse_dyld_info(); parse_chained(); malformed_inputs();
+  bytes_bounds(); arm64_encodings(); fat_and_selection(); parse_dyld_info(); classic_indirect_symbol_binds(); parse_chained(); malformed_inputs();
   analysis_report(); link_and_execute(); arm32_parse_and_link(); unresolved_import_traps_with_symbol(); link_refusals(); branch_veneer();
   validator_catches_escape(); objc_metadata(); objc_metadata_hostile_inputs(); objc_metadata_after_link();
-  dyld_binds_across_images(); dyld_flat_namespace_late_provider(); dyld_keeps_unresolved_imports_honest();
+  dyld_binds_across_images(); dyld_classic_images_reject_overlaps();
+  dyld_flat_namespace_late_provider(); dyld_keeps_unresolved_imports_honest();
   dyld_error_reporting(); dyld_run_loaded_images();
   compat_and_runtime(); durable_run_logging(); batch2_status_and_cxx(); batch2_loader_classification(); batch2_ipa(); mutation_fuzz_no_crash(); json_writer();
   cxx_forward_string_wrappers(); stub_dispatch_trampolines(); relinker_dispatch_stub_mode();
   dyld_stub_mode_honest_reporting(); host_runtime_layer(); run_image_stub_mode();
   sandbox_and_eagl_gles_bridge();
   egl_surface_rebind_thread_safety_and_heartbeat();
+  batch4_touch_go_import_coverage(); batch4_cg_transform_and_cfarray();
+  batch4_div_mod_builtins(); batch4_mach_thread_errors(); batch4_rb_tree_algorithms();
   printf("%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;
 }

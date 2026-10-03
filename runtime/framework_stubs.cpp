@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -706,6 +707,156 @@ uint64_t zeroShim() { return 0; }                                 // nil / NULL 
 uint64_t emptyStringShim() { return reinterpret_cast<uint64_t>(g_emptyString); }
 uint64_t poolPushShim() { return reinterpret_cast<uint64_t>(g_dummyPoolToken); }
 double zeroDoubleShim() { return 0.0; }
+// --- Batch 4 (Touch & Go 1.1): CoreGraphics math and CF array shims ------------------------
+// CGAffineTransform is a 6-float struct (a,b,c,d,tx,ty). A 24-byte struct exceeds the four
+// AAPCS core registers, so every ABI that matters here passes it by memory (caller copy,
+// pointer in the first argument register) -- armv6, armv7 and arm64 all agree. The shims
+// below therefore take const void* pointers to guest structs. The pure math lives in
+// cgTransform* helpers so host tests can exercise it without the ABI shim layer.
+
+struct CGAffineTransform {
+  float a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;
+};
+
+// The identity constant is a real data symbol: the guest reads these 24 bytes directly.
+const CGAffineTransform g_CGAffineTransformIdentity{1, 0, 0, 1, 0, 0};
+
+// CGAffineTransformScale(t, sx, sy): out = [sx*s.a 0 0 sy*s.tx sx s.ty*s.sy] in row terms --
+// Apple's definition: (sx*a, sx*b, sy*c, sy*d, tx*sx, ty*sy).
+void cgTransformScale(const CGAffineTransform& t, float sx, float sy, CGAffineTransform& out) {
+  out = CGAffineTransform{t.a * sx, t.b * sx, t.c * sy, t.d * sy, t.tx * sx, t.ty * sy};
+}
+
+bool cgTransformIsIdentity(const CGAffineTransform& t) {
+  return t.a == 1 && t.b == 0 && t.c == 0 && t.d == 1 && t.tx == 0 && t.ty == 0;
+}
+
+uint64_t shimCGAffineTransformScale(void* result, const void* t, float sx, float sy) {
+  // AAPCS: a 24-byte struct return value is written through a caller-provided result pointer
+  // that arrives in the first argument register, and the 24-byte argument is itself passed by
+  // reference in the second register. Floats ride in VFP registers (hard-float AAPCS, the
+  // ABI every iOS armv6 build and the ARM32 Android host share).
+  if (!result || !t) return 0;
+  CGAffineTransform src;
+  std::memcpy(&src, t, sizeof src);
+  CGAffineTransform out;
+  cgTransformScale(src, sx, sy, out);
+  std::memcpy(result, &out, sizeof out);
+  return reinterpret_cast<uint64_t>(result);
+}
+
+uint64_t shimCGAffineTransformIsIdentity(const void* t) {
+  CGAffineTransform v;
+  std::memcpy(&v, t, sizeof v);
+  return cgTransformIsIdentity(v) ? 1 : 0;
+}
+
+// --- CoreFoundation CFArray subset ----------------------------------------------------------
+// A real, small CFArray: NULL allocator means "the default" (malloc-backed, like
+// kCFAllocatorDefault), NULL callbacks mean the values are unretained pointers. The guest
+// only needs create/append/get/count/remove/removeAll, all implemented with the actual
+// CFArray semantics for this subset.
+struct CompatCFArray {
+  std::vector<const void*> values;
+};
+
+// Arrays live for the whole process (the guest holds bare CFArrayRefs; CFRelease is a stub),
+// kept reachable from a root the same way the dummy class/data blocks are, so LeakSanitizer
+// sees exactly the intended never-freed lifetime.
+std::vector<std::unique_ptr<CompatCFArray>>& compatCFArrays() {
+  static auto& arrays = *new std::vector<std::unique_ptr<CompatCFArray>>();
+  return arrays;
+}
+
+void* shimCFArrayCreateMutable(const void* /*allocator*/, intptr_t /*capacity*/, const void* /*callbacks*/) {
+  noteCompatCall("CFArrayCreateMutable");
+  auto owned = std::make_unique<CompatCFArray>();
+  CompatCFArray* a = owned.get();
+  compatCFArrays().push_back(std::move(owned));
+  return a;
+}
+
+void shimCFArrayAppendValue(void* array, const void* value) {
+  if (auto* a = static_cast<CompatCFArray*>(array)) a->values.push_back(value);
+}
+
+const void* shimCFArrayGetValueAtIndex(void* array, intptr_t index) {
+  auto* a = static_cast<CompatCFArray*>(array);
+  if (!a || index < 0 || size_t(index) >= a->values.size()) return nullptr;
+  return a->values[size_t(index)];
+}
+
+intptr_t shimCFArrayGetCount(void* array) {
+  auto* a = static_cast<CompatCFArray*>(array);
+  return a ? intptr_t(a->values.size()) : 0;
+}
+
+void shimCFArrayRemoveValueAtIndex(void* array, intptr_t index) {
+  auto* a = static_cast<CompatCFArray*>(array);
+  if (a && index >= 0 && size_t(index) < a->values.size()) a->values.erase(a->values.begin() + index);
+}
+
+void shimCFArrayRemoveAllValues(void* array) {
+  if (auto* a = static_cast<CompatCFArray*>(array)) a->values.clear();
+}
+
+// objc_copyStruct is exactly what its name says: a sized struct copy (used for ABI struct
+// returns/copies). Real implementation, not a stub.
+void shimObjcCopyStruct(void* dst, const void* src, size_t size) {
+  if (dst && src && size) std::memmove(dst, src, size);
+}
+
+// --- AudioToolbox shims ---------------------------------------------------------------------
+// OSStatus four-char-codes: reporting *an* error is the contract; the guest is expected to
+// degrade gracefully. '!sta' (cannot start) for queues, 'typ?' (unsupported type) for files,
+// 'eof?' (end of file) for reads with a zeroed byte count.
+constexpr uint32_t kAQErrCannotStart = 0x21737461u;      // '!sta'
+constexpr uint32_t kAQErrInvalidProperty = 0x21707261u;  // '!pra'
+constexpr uint32_t kAFErrUnsupportedType = 0x7479703Fu;  // 'typ?'
+constexpr uint32_t kAFErrEndOfFile = 0x656F663Fu;        // 'eof?'
+
+uint64_t audioQueueNewOutputShim(const void*, const void*, const void*, const void*,
+                                 const void*, uint32_t, void** outQueue) {
+  noteCompatCall("AudioQueueNewOutput");
+  if (outQueue) *outQueue = nullptr;
+  return kAQErrCannotStart;
+}
+
+uint64_t audioQueueGetProperty(const void*, uint32_t, void*, uint32_t* ioSize) {
+  noteCompatCall("AudioQueueGetProperty");
+  if (ioSize) *ioSize = 0;
+  return kAQErrInvalidProperty;
+}
+
+uint64_t audioFileOpenURLShim(const void*, uint32_t, uint32_t, void** outFileID) {
+  noteCompatCall("AudioFileOpenURL");
+  if (outFileID) *outFileID = nullptr;
+  return kAFErrUnsupportedType;
+}
+
+uint64_t audioFileGetPropertyShim(const void*, uint32_t, uint32_t* ioSize, void*) {
+  noteCompatCall("AudioFileGetProperty");
+  if (ioSize) *ioSize = 0;
+  return kAQErrInvalidProperty;
+}
+
+uint64_t audioFileGetPropertyInfoShim(const void*, uint32_t, uint32_t* outSize, uint32_t* outWritable) {
+  noteCompatCall("AudioFileGetPropertyInfo");
+  if (outSize) *outSize = 0;
+  if (outWritable) *outWritable = 0;
+  return kAQErrInvalidProperty;
+}
+
+uint64_t audioFileReadBytesShim(const void*, uint8_t, uint32_t, uint32_t* ioNumBytes, void*) {
+  noteCompatCall("AudioFileReadBytes");
+  if (ioNumBytes) *ioNumBytes = 0;
+  return kAFErrEndOfFile;
+}
+
+void glGetRenderbufferParameterivOESShim(uint32_t, uint32_t, int32_t* params) {
+  noteCompatCall("glGetRenderbufferParameterivOES");
+  if (params) params[0] = 0;
+}
 
 // Selector-aware objc_msgSend shim: bridges EAGLContext, UIWindow, CADisplayLink, and
 // Foundation path/string selectors while preserving x0 pass-through for everything else.
@@ -1425,6 +1576,85 @@ void registerFrameworkStubs(relinker::CompatRegistry& reg) {
   addShim(reg, "_CFRunLoopRun", reinterpret_cast<Fn>(voidShim), "CoreFoundation");
   addShim(reg, "_CFRunLoopStop", reinterpret_cast<Fn>(voidShim1), "CoreFoundation");
   addShim(reg, "_CFAbsoluteTimeGetCurrent", reinterpret_cast<Fn>(zeroDoubleShim), "CoreFoundation");
+  // --- CoreGraphics (Batch 4: Touch & Go 1.1) ------------------------------------------------
+  // Real implementations where the semantics are pure computation; the full Quartz 2D
+  // rasterizer remains out of scope and everything else is left to the trap-stub reporter.
+  reg.add("_CGAffineTransformIdentity", reinterpret_cast<uint64_t>(&g_CGAffineTransformIdentity),
+          {compat::SymbolClass::CompatibilityShim, "CoreGraphics", "identity_constant"});
+  addShim(reg, "_CGAffineTransformScale", reinterpret_cast<Fn>(shimCGAffineTransformScale), "CoreGraphics");
+  addShim(reg, "_CGAffineTransformIsIdentity", reinterpret_cast<Fn>(shimCGAffineTransformIsIdentity), "CoreGraphics");
+  // Color spaces become real, empty reference objects (created -> releasable), the shape the
+  // API promises; the raster context and image functions stay unsupported on purpose.
+  addShim(reg, "_CGColorSpaceCreateDeviceGray", reinterpret_cast<Fn>(poolPushShim), "CoreGraphics");
+  addShim(reg, "_CGColorSpaceCreateDeviceRGB", reinterpret_cast<Fn>(poolPushShim), "CoreGraphics");
+  addShim(reg, "_CGColorSpaceRelease", reinterpret_cast<Fn>(voidShim1), "CoreGraphics");
+  addShim(reg, "_objc_copyStruct", reinterpret_cast<Fn>(shimObjcCopyStruct), "libobjc");
+
+  // --- CoreFoundation arrays (Batch 4) --------------------------------------------------------
+  addShim(reg, "_CFArrayCreateMutable", reinterpret_cast<Fn>(shimCFArrayCreateMutable), "CoreFoundation");
+  addShim(reg, "_CFArrayAppendValue", reinterpret_cast<Fn>(shimCFArrayAppendValue), "CoreFoundation");
+  addShim(reg, "_CFArrayGetValueAtIndex", reinterpret_cast<Fn>(shimCFArrayGetValueAtIndex), "CoreFoundation");
+  addShim(reg, "_CFArrayGetCount", reinterpret_cast<Fn>(shimCFArrayGetCount), "CoreFoundation");
+  addShim(reg, "_CFArrayRemoveValueAtIndex", reinterpret_cast<Fn>(shimCFArrayRemoveValueAtIndex), "CoreFoundation");
+  addShim(reg, "_CFArrayRemoveAllValues", reinterpret_cast<Fn>(shimCFArrayRemoveAllValues), "CoreFoundation");
+  // No CoreFoundation object runtime: an unrepresentable CF type reports failure (NULL).
+  addShim(reg, "_CFURLCreateFromFileSystemRepresentation", reinterpret_cast<Fn>(zeroShim), "CoreFoundation");
+  // UIGraphics*Context: no CoreGraphics context backend; balanced no-ops.
+  addShim(reg, "_UIGraphicsPushContext", reinterpret_cast<Fn>(voidShim1), "UIKit");
+  addShim(reg, "_UIGraphicsPopContext", reinterpret_cast<Fn>(voidShim), "UIKit");
+
+  // --- OpenGL ES 1.x fixed-function entry points (Batch 4) ------------------------------------
+  // GLES1-only names have no libGLESv2 export to forward to (no fixed pipeline there).
+  // Matrix/vertex-array state is not tracked; buffer/query results report zeros, so the
+  // guest sees "no framebuffer objects available" rather than a fabricated success.
+  for (const char* n : {"_glEnableClientState", "_glDisableClientState", "_glVertexPointer",
+                        "_glTexCoordPointer", "_glColorPointer", "_glTranslatef", "_glRotatef",
+                        "_glPushMatrix", "_glPopMatrix", "_glMatrixMode", "_glLoadIdentity",
+                        "_glOrthof"})
+    addShim(reg, n, reinterpret_cast<Fn>(voidShim), "OpenGLES");
+  addShim(reg, "_glGenFramebuffersOES", reinterpret_cast<Fn>(voidShim2), "OpenGLES");
+  addShim(reg, "_glGenRenderbuffersOES", reinterpret_cast<Fn>(voidShim2), "OpenGLES");
+  addShim(reg, "_glDeleteFramebuffersOES", reinterpret_cast<Fn>(voidShim2), "OpenGLES");
+  addShim(reg, "_glDeleteRenderbuffersOES", reinterpret_cast<Fn>(voidShim2), "OpenGLES");
+  addShim(reg, "_glBindFramebufferOES", reinterpret_cast<Fn>(voidShim2), "OpenGLES");
+  addShim(reg, "_glBindRenderbufferOES", reinterpret_cast<Fn>(voidShim2), "OpenGLES");
+  addShim(reg, "_glFramebufferRenderbufferOES", reinterpret_cast<Fn>(voidShim2), "OpenGLES");
+  addShim(reg, "_glGetRenderbufferParameterivOES", reinterpret_cast<Fn>(glGetRenderbufferParameterivOESShim), "OpenGLES");
+  addShim(reg, "_glCheckFramebufferStatusOES", reinterpret_cast<Fn>(zeroShim), "OpenGLES");
+
+  // --- AudioToolbox / OpenAL (Batch 4): no audio backend yet ----------------------------------
+  // Every call is logged by the stub machinery when unbound; binding them here trades trap
+  // noise for explicit, honest no-audio shims. alGetError returns AL_NO_ERROR (0), which is
+  // the API's own "nothing wrong" value; alcOpenDevice returns NULL (no device), and
+  // AudioQueueNewOutput refuses with kAudioQueueErr_CannotStart rather than faking a running
+  // queue whose callbacks would never fire.
+  for (const char* n : {"_alGenSources", "_alDeleteSources", "_alGenBuffers",
+                        "_alDeleteBuffers", "_alSourcePlay", "_alSourceStop", "_alSourcef",
+                        "_alSourcei", "_alSourceQueueBuffers", "_alSourceUnqueueBuffers"})
+    addShim(reg, n, reinterpret_cast<Fn>(voidShim), "OpenAL");
+  addShim(reg, "_alGetError", reinterpret_cast<Fn>(zeroShim), "OpenAL");
+  addShim(reg, "_alGetSourcei", reinterpret_cast<Fn>(voidShim2), "OpenAL");
+  addShim(reg, "_alcDestroyContext", reinterpret_cast<Fn>(voidShim1), "OpenAL");
+  addShim(reg, "_alcCloseDevice", reinterpret_cast<Fn>(voidShim1), "OpenAL");
+  addShim(reg, "_alcMakeContextCurrent", reinterpret_cast<Fn>(zeroShim), "OpenAL");
+  addShim(reg, "_alcCreateContext", reinterpret_cast<Fn>(zeroShim), "OpenAL");
+  addShim(reg, "_alcOpenDevice", reinterpret_cast<Fn>(zeroShim), "OpenAL");
+  addShim(reg, "_alcGetProcAddress", reinterpret_cast<Fn>(zeroShim), "OpenAL");
+  for (const char* n : {"_AudioQueueAllocateBuffer", "_AudioQueueEnqueueBuffer",
+                        "_AudioQueueFreeBuffer", "_AudioQueueSetProperty",
+                        "_AudioQueueSetParameter", "_AudioQueueAddPropertyListener",
+                        "_AudioQueuePrime", "_AudioQueueStart", "_AudioQueueStop",
+                        "_AudioQueueDispose"})
+    addShim(reg, n, reinterpret_cast<Fn>(zeroShim), "AudioToolbox");
+  addShim(reg, "_AudioQueueNewOutput", reinterpret_cast<Fn>(audioQueueNewOutputShim), "AudioToolbox");
+  addShim(reg, "_AudioQueueGetProperty", reinterpret_cast<Fn>(audioQueueGetProperty), "AudioToolbox");
+  addShim(reg, "_AudioFileOpenURL", reinterpret_cast<Fn>(audioFileOpenURLShim), "AudioToolbox");
+  addShim(reg, "_AudioFileClose", reinterpret_cast<Fn>(zeroShim), "AudioToolbox");
+  addShim(reg, "_AudioFileGetProperty", reinterpret_cast<Fn>(audioFileGetPropertyShim), "AudioToolbox");
+  addShim(reg, "_AudioFileGetPropertyInfo", reinterpret_cast<Fn>(audioFileGetPropertyInfoShim), "AudioToolbox");
+  addShim(reg, "_AudioFileReadBytes", reinterpret_cast<Fn>(audioFileReadBytesShim), "AudioToolbox");
+  addShim(reg, "_AudioFileReadPackets", reinterpret_cast<Fn>(zeroShim), "AudioToolbox");
+
 
   // --- UIKit --------------------------------------------------------------------------------
   addShim(reg, "_UIApplicationMain", reinterpret_cast<Fn>(uiApplicationMainShim), "UIKit");

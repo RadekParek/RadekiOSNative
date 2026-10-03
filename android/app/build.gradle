@@ -1,11 +1,17 @@
 plugins { id 'com.android.application' }
 
 def ndkRoot = System.getenv("ANDROID_NDK_ROOT")
+def ndkRev = ""
+if (ndkRoot) {
+    def props = new Properties()
+    def f = new File(ndkRoot, "source.properties")
+    if (f.isFile()) { f.withInputStream { props.load(it) }; ndkRev = props.getProperty("Pkg.Revision", "") }
+}
 
 android {
     namespace 'org.radekiosnative.recompiler'
     compileSdk 34
-    if (ndkRoot) { ndkVersion new File(ndkRoot).name }
+    if (ndkRev) { ndkVersion ndkRev }
     defaultConfig {
         applicationId "org.radekiosnative.recompiler"
         minSdk 26

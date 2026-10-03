@@ -1,25 +1,45 @@
 # RadekiOSNative
-Native-first iOS -> Android ARM64 / ARMv7 compatibility foundation. Matching guest instructions are relinked and run natively in an ABI-matched Android process, not emulated.
+Native-first iOS -> Android ARM64 / ARM32 (ARMv6/ARMv7) compatibility foundation. Matching guest instructions are relinked and run natively in an ABI-matched Android process, not emulated.
 
 ## What works (host regression suite; see CI for Android APK builds)
-- Mach-O: thin/fat, 32/64-bit, load commands, symbols, dyld-info rebase/bind, chained fixups (PTR_64, PTR_64_OFFSET, arm64e formats parsed), function starts, data-in-code, encryption info; hostile input rejected (mutation fuzz test).
+- Mach-O: thin/fat, 32/64-bit, load commands, symbols, dyld-info rebase/bind, chained fixups (PTR_64, PTR_64_OFFSET, arm64e formats parsed), classic indirect-symbol pointer binds for pre-dyld-info images, function starts, data-in-code and encryption info; hostile input rejected (mutation fuzz test).
 - Analyzer: functions, call/branch/ADRP xrefs, PAC instruction counts, framework/ObjC/Swift/Metal/GLES hints, static blockers.
 - Objective-C metadata (read-only): class objects -> `class_ro_t`, instance and class methods (both the classic absolute-pointer and the relative 12-byte encodings), ivars, properties, categories, protocols. It never throws on hostile metadata: anything it cannot verify is reported as a warning and flips `complete` to false. This is metadata reading, **not** a runtime: nothing is registered, dispatched or called.
-- ARM64 / ARMv7 pointer relinker: architecture-width rebases and binds, 16K ARM64 and 4K ARMv7 mappings, named BRK/BKPT trap stubs by default (never fake success), or logging no-op dispatch stubs (still reported unresolved). ARM64 supports B/BL veneers and instruction validation; ARMv7 branch rewriting and instruction validation are not implemented.
+- ARM64 / ARM32 (ARMv6/ARMv7) pointer relinker: architecture-width rebases and binds, 16K ARM64 and 4K ARM32 mappings, named BRK/BKPT trap stubs by default (never fake success), or logging no-op dispatch stubs (still reported unresolved). Classic images must remain at their preferred address because they have no rebase records. ARM64 supports B/BL veneers and instruction validation; ARM32 branch rewriting and instruction validation are not implemented.
 - Host runtime layer: libSystem subset + written libc++abi shims + libc++.1.dylib forwarding (explicit `std::string` and `__next_prime` wrappers under Apple's exact mangled names, plus a dlsym pass-through onto the host libc++) + partial framework shims (`UIApplicationMain`, `NSLog`, the objc memory family, ~80 dummy `_OBJC_CLASS_$_` objects for UIKit/EAGL/Foundation) and an EAGL/EGL bridge onto Android's libEGL/libGLESv2. UIKit/Foundation remain unsupported as full runtimes; the shims do not provide a game UI, and the objc_msgSend shim does not dispatch guest methods. See `docs/stubs-and-cxx-forwarding.md`.
 - EGL/Surface bridge with render-thread ownership: Android Surface create/resize arriving on the UI thread never rebuilds the EGL surface in place while the guest render thread holds the context - the rebind is queued and applied on the render thread (explicit `eglMakeCurrent(EGL_NO_*)` unbind first), which removes the EGL_BAD_ACCESS (0x3002) path. A CADisplayLink/engine frame heartbeat (60 FPS, `frameInterval` honored, 30 FPS fallback) invokes the registered target selector every frame cycle and presents with `eglSwapBuffers` right after the render step; `successfulSwaps`/`engineForcedSwaps` are logged and surfaced live. Sandbox creation is verified on disk (including `Documents/games/com.mojang/`) at launch. All of this is host-tested bookkeeping and forwarding; visible game frames on a device remain unverified.
 - Validation: every PC-relative reference is checked against the mapped image. It walks real instruction ranges (sections marked `S_ATTR_*_INSTRUCTIONS`, plus trap stubs and veneers), so Mach-O headers, load commands and string constants are not mistaken for code.
 - Loader (`loader/dyld.*`): several images in one address space -- dependency-first link order, per-image load bases and slides, cross-image binding (two-level, re-export chains, flat-namespace), per-image unresolved-import reporting. Two passes: the first fixes the layout, the second binds against the complete export table.
-- Runtime: maps ARM64 or ARMv7 images into a matching 64-bit or 32-bit ARM process with W^X protections, signal diagnostics and a partial libSystem subset. ARM32 has a synthetic native entrypoint self-test; complete game startup/Objective-C ABI coverage remains unfinished.
+- Runtime: maps ARM64 or ARM32 images into a matching 64-bit or 32-bit ARM process with W^X protections, signal diagnostics and a partial libSystem subset. ARM32 has a synthetic native entrypoint self-test; complete game startup/Objective-C ABI coverage remains unfinished.
 - Diagnostics: each launch writes a private persistent run log with native stage, EGL/Surface, render-loop and crash details. RTLS samples compatibility calls and graphics heartbeats only when enabled (off by default); logs are viewable, copyable and shareable from run history.
 - Verification: a test-only mini AArch64 interpreter runs a relinked synthetic image and checks output; cross-image binding is verified structurally (bound pointers land inside the provider image, no trap stubs left).
 
 ## Not done (see progress.json / capabilities.json)
-CI successfully built and verified the Android ARM64 and ARM32 APKs, but guest execution on real devices remains unverified. ARMv7 has initial pointer relinking, a 32-bit trap stub and a minimal self-test; branch rewriting, code validation, full 32-bit system-ABI coverage and real-game startup still need work. ARM64e PAC, a functional Objective-C runtime (message dispatch/class registration), full Foundation/UIKit, CoreFoundation/CoreGraphics/QuartzCore, Metal/GLES/Vulkan game rendering, audio, input, networking and complete filesystem compatibility remain incomplete.
+CI successfully built and verified the Android ARM64 and ARM32 APKs, but guest execution on real devices remains unverified. ARM32 has initial pointer relinking (including ARMv6 classic-image binds), a 32-bit trap stub and a minimal self-test; branch rewriting, code validation, full 32-bit system-ABI coverage and real-game startup still need work. ARM64e PAC, a functional Objective-C runtime (message dispatch/class registration), full Foundation/UIKit, complete CoreFoundation/CoreGraphics/QuartzCore (only small subsets exist), Metal/GLES/Vulkan game rendering, audio, input, networking and complete filesystem compatibility remain incomplete.
 The loader has no dyld shared cache, no `@rpath`/`@executable_path` expansion against a filesystem, no cross-image initializer ordering and no weak-symbol coalescing. Encrypted (FairPlay) binaries are refused; the tool does not decrypt anything.
 
+## ARMv6 and classic Mach-O compatibility
+
+Pre-dyld-info images have no rebase opcodes, so their internal pointers are only valid at the
+preferred vmaddr. The parser now synthesizes external pointer binds from the indirect-symbol
+table (including the high-byte nlist library ordinal and weak-reference flag); the multi-image
+loader keeps classic images at slide zero and rejects overlapping mappings. `validate` and
+`convert` default to the preferred address unless `--load-base` is explicitly supplied.
+
+The ARM32 host layer now includes the pre-libc++ `libstdc++.6` red-black-tree helpers and inert
+SjLj registration, legacy libgcc division helpers, additional libm/stdio/pthread symbols, a
+small CoreGraphics transform and CoreFoundation array subset, and `objc_copyStruct`. C++
+exception handling, full framework runtimes, GLES 1.x rendering and audio remain unsupported;
+those entry points are limited compatibility shims, not real graphics/audio implementations.
+The CLI also accepts `RADEKI_RUN_LOG=<path>` for persistent run output, and `make` builds the
+`dump_sections` inspection utility.
+
+The fork's commit reports a QEMU smoke test with Touch & Go 1.1 reaching `UIApplicationMain`;
+that app binary is not part of this repository, so that run was not reproduced here. Device
+execution and a visible game screen remain unverified.
+
 ## Build
-`make` / `make test` / `make SAN=1 test` (host), or CMake (`CMakeLists.txt`), or the Android app under `android/`.
+`make` / `make test` / `make SAN=1 test` (host), or CMake (`CMakeLists.txt`), or the Android app under `android/`. `make` also builds `build/dump_sections`.
 
 CLI:
 ```
@@ -30,6 +50,7 @@ radeki convert  <macho> [-o dir] [--load-base 0x..] [--json]
 radeki validate <macho> [--load-base 0x..] [--json]
 radeki load     <exe> [--dylib <path>]... [--load-base 0x..] [--json] [--stubs]
 radeki run      <exe> [--dylib <path>]... [--load-base 0x..] [--json] [--traps]   # needs a matching ARM process
+build/dump_sections <macho>  # print sections and indirect-symbol indexes
 ```
 `run` uses the host runtime layer with dispatch stubs by default (so unbound imports log and
 return safe defaults instead of SIGTRAP); `--traps` restores honest BRK trap stubs. `load` and

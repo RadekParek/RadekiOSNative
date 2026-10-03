@@ -7,7 +7,7 @@ LIBSRC = mach_o/macho.cpp binary_analysis/analysis.cpp objc/objc.cpp loader/dyld
 BUILD = build
 LIBOBJ = $(LIBSRC:%.cpp=$(BUILD)/%.o)
 
-all: $(BUILD)/radeki $(BUILD)/radeki_tests
+all: $(BUILD)/radeki $(BUILD)/radeki_tests $(BUILD)/dump_sections
 $(BUILD)/%.o: %.cpp $(wildcard */*.h)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -16,6 +16,8 @@ $(BUILD)/libradeki.a: $(LIBOBJ)
 $(BUILD)/radeki: $(BUILD)/tools/radeki.o $(BUILD)/libradeki.a
 	$(CXX) $(CXXFLAGS) $^ -o $@
 $(BUILD)/radeki_tests: $(BUILD)/tests/test_main.o $(BUILD)/libradeki.a
+	$(CXX) $(CXXFLAGS) $^ -o $@
+$(BUILD)/dump_sections: $(BUILD)/tools/dump_sections.o $(BUILD)/libradeki.a
 	$(CXX) $(CXXFLAGS) $^ -o $@
 test: $(BUILD)/radeki_tests
 	$(BUILD)/radeki_tests

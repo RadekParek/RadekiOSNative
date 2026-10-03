@@ -24,6 +24,7 @@ constexpr uint64_t kDefaultLoadBase = 0x10000000;
 #else
 constexpr uint64_t kDefaultLoadBase = 0x200000000ull;
 #endif
+constexpr uint64_t kDefaultLoadBaseArm32 = 0x10000000;  // host-independent ARM32 default
 constexpr bool isArm32Architecture(macho::Arch arch) {
   return arch == macho::Arch::ARMv6 || arch == macho::Arch::ARMv7 ||
          arch == macho::Arch::ARMv7s || arch == macho::Arch::ARMv7k;

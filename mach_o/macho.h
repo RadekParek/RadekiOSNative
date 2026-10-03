@@ -17,7 +17,9 @@ Arch archFromCpu(uint32_t cputype, uint32_t cpusubtype);
 
 enum : uint32_t {
   MH_EXECUTE = 2, MH_DYLIB = 6, MH_BUNDLE = 8,
-  S_ZEROFILL = 0x1, S_MOD_INIT_FUNC_POINTERS = 0x9, S_MOD_TERM_FUNC_POINTERS = 0xA,
+  S_ZEROFILL = 0x1, S_NON_LAZY_SYMBOL_POINTERS = 0x6, S_LAZY_SYMBOL_POINTERS = 0x7,
+  S_SYMBOL_STUBS = 0x8, S_MOD_INIT_FUNC_POINTERS = 0x9, S_MOD_TERM_FUNC_POINTERS = 0xA,
+  INDIRECT_SYMBOL_ABS = 0x40000000u, INDIRECT_SYMBOL_LOCAL = 0x80000000u,
   S_GB_ZEROFILL = 0xC, S_THREAD_LOCAL_REGULAR = 0x11, S_THREAD_LOCAL_ZEROFILL = 0x12,
   S_THREAD_LOCAL_VARIABLES = 0x13, S_ATTR_PURE_INSTRUCTIONS = 0x80000000u,
   S_ATTR_SOME_INSTRUCTIONS = 0x00000400u,
@@ -105,6 +107,7 @@ struct Image {
   std::optional<uint64_t> entry;                              // unslid vmaddr
   uint32_t buildPlatform = 0, minOs = 0, sdk = 0;
   bool hasChainedFixups = false, hasDyldInfo = false;
+  bool classicBinds = false;  // binds synthesized from the indirect symbol table (pre-dyld-info image)
   uint32_t chainedPointerFormat = 0;
   bool hasExportsTrie = false;
   bool hasCodeSignature = false;

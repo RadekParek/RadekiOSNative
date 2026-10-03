@@ -28,7 +28,8 @@ static std::vector<uint8_t> slurp(const char* p) {
 static void jsonImage(JsonWriter& j, const macho::Image& img, const analysis::Report& rep) {
   j.kv("arch", macho::archName(img.arch)).kvb("is64", img.is64).kv("uuid", img.uuid).kvu("segments", img.segments.size());
   if (img.entry) j.kvh("entry", *img.entry);
-  j.kvb("chainedFixups", img.hasChainedFixups).kvu("fixups", img.fixups.size()).kvu("imports", img.imports.size());
+  j.kvb("chainedFixups", img.hasChainedFixups).kvb("classicBinds", img.classicBinds)
+      .kvu("fixups", img.fixups.size()).kvu("imports", img.imports.size());
   j.kvb("encrypted", img.cryptId != 0).kvb("codeSignature", img.hasCodeSignature).kvb("tls", img.hasTLS);
   j.kvb("objc", rep.objc).kvb("swift", rep.swift).kvb("metal", rep.metal).kvb("opengles", rep.gles).kvb("audio", rep.audio);
   j.kvu("instructions", rep.instructions).kvu("functions", rep.functions.size()).kvu("xrefs", rep.xrefs.size());
@@ -150,6 +151,7 @@ int main(int argc, char** argv) {
     if (!choice.index) throw FormatError(choice.reason);
     auto img = macho::parseSlice(file, slices[*choice.index]);
     auto rep = analysis::analyze(img);
+    if (!baseSet && relinker::isArm32Architecture(img.arch)) base = relinker::kDefaultLoadBaseArm32;
     JsonWriter j; j.beginObject().kv("command", cmd).kv("sliceChoice", choice.reason);
     if (cmd == "analyze") {
       jsonImage(j, img, rep);
@@ -211,6 +213,7 @@ int main(int argc, char** argv) {
       if (useStubs) host = runtime::makeHostRuntime();
       loader::Options o;
       if (baseSet) o.firstBase = base;
+      else if (relinker::isArm32Architecture(img.arch)) o.firstBase = relinker::kDefaultLoadBaseArm32;
       o.fallback = useStubs ? static_cast<const relinker::ImportResolver*>(&host.registry) : &compat;
       if (useStubs) o.stubFactory = host.stubFactory;
       j.kvu("images", reg.size());
@@ -235,6 +238,8 @@ int main(int argc, char** argv) {
         // 3 means "loaded, but something is still unbound": honest, and distinct from a failure.
         return lr.ok() ? (lr.unresolved.empty() ? 0 : 3) : 1;
       }
+      // Opt-in persistent run log for CLI launches (the Android launcher passes its own path).
+      if (const char* logPath = std::getenv("RADEKI_RUN_LOG")) runtime::beginRunLog(logPath, true);
       auto mr = runtime::runLoadedImage(reg, o);
       j.kvb("ok", mr.ok()).kvb("ran", mr.ran).kvb("crashed", mr.crashed);
       j.key("exitCode").num(mr.exitCode);
@@ -255,6 +260,8 @@ int main(int argc, char** argv) {
     } else if (cmd == "convert" || cmd == "validate") {
       relinker::CompatRegistry none;  // no compatibility libraries exist yet: every import is reported unresolved
       relinker::LinkOptions o; o.loadBase = base; o.resolver = &none;
+      if (!baseSet && img.classicBinds)
+        o.loadBase = img.textBase();  // classic images only bind correctly at slide 0
       auto li = relinker::link(img, o);
       auto v = relinker::validate(li);
       j.kvh("loadBase", li.loadBase).kvu("imageSize", li.imageSize).kvu("rebases", li.rebases).kvu("binds", li.binds);
@@ -265,6 +272,7 @@ int main(int argc, char** argv) {
       if (cmd == "convert") {
         if (!outDir) throw FormatError("convert needs -o <dir>");
         std::string d = outDir;
+        std::filesystem::create_directories(d);
         std::ofstream(d + "/image.bin", std::ios::binary).write((const char*)li.memory.data(), li.memory.size());
       }
       if (!v.ok()) { j.endObject(); puts(j.str().c_str()); return 1; }

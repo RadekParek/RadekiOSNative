@@ -16,6 +16,7 @@ struct Opts {
   uint32_t cpusub = 0;       // 2 => arm64e
   uint32_t cryptid = 0;
   bool flatImport = false;   // add one extra import bound with ordinal -2 (flat namespace)
+  bool classicBinds = false; // omit dyld-info and bind through the indirect symbol table
 };
 constexpr uint64_t kBase = 0x100000000ull, kText = kBase + 0x1000, kStr = kBase + 0x2010, kData = kBase + 0x4000;
 constexpr int kHelperIdx = 15;
@@ -135,6 +136,12 @@ inline Buf build(const Opts& o = {}) {
   struct N { uint32_t x; uint8_t t, s; uint16_t d; uint64_t v; };
   N syms[4] = {{1, 0x0E, 1, 0, kText + kHelperIdx * 4}, {9, 0x0F, 1, 0, kText}, {15, 0x01, 0, 0x100, 0}, {21, 0x01, 0, 0x100, 0}};
   std::memcpy(&f[le + 0x100], syms, sizeof syms);
+  if (o.classicBinds) {
+    // The __got section has two pointer slots whose indirect-symbol entries name _puts and
+    // _missing_fn. Keep the table at the end of __LINKEDIT without overlapping the string table.
+    p32(f, le + 0x178, 2);
+    p32(f, le + 0x17C, 3);
+  }
 
   Buf lc;
   auto seg = [&](const char* n, uint64_t va, uint64_t vs, uint64_t fo, uint64_t fs, uint32_t prot, uint32_t nsect) {
@@ -155,8 +162,9 @@ inline Buf build(const Opts& o = {}) {
   sect("__data", "__DATA", kData + 0x10, o.flatImport ? 16 : 8, 0x4010, 0);
   seg("__LINKEDIT", kBase + 0x8000, 0x4000, le, 0x180, 1, 0);
   uint32_t ncmds = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1;  // 4 segs + fixups + symtab + dysymtab + dylib + main + uuid + fstarts
+  if (o.classicBinds) --ncmds;
   if (o.chainedFmt) { put(lc, 0x80000034); put(lc, 16); put(lc, le + 0x80); put(lc, chainedSize); }
-  else {
+  else if (!o.classicBinds) {
     put(lc, 0x80000022); put(lc, 48);
     uint32_t v[10] = {le, 5, le + 0x20, (uint32_t)bind.size(), 0, 0, 0, 0, 0, 0};
     for (uint32_t x : v) put(lc, x);
@@ -164,6 +172,7 @@ inline Buf build(const Opts& o = {}) {
   put(lc, 2); put(lc, 24); put(lc, le + 0x100); put(lc, 4); put(lc, le + 0x140); put(lc, sizeof strtab);
   put(lc, 0xB); put(lc, 80);
   uint32_t dy[18] = {0, 1, 1, 1, 2, 2};
+  if (o.classicBinds) { dy[12] = le + 0x178; dy[13] = 2; }
   for (uint32_t x : dy) put(lc, x);
   const char* ln = "/usr/lib/libSystem.B.dylib";
   put(lc, 0xC); put(lc, 56); put(lc, 24); put(lc, 0); put(lc, 0x10000); put(lc, 0x10000);

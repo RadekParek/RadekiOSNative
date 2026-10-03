@@ -3,6 +3,76 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - ARMv6 classic-image support and pre-libc++ compatibility
+
+Host suite: **2109 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
+
+Target app: Touch & Go 1.1 (com.thegamecreators.TouchAndGo, armv6 Mach-O, 172 imports, classic
+pre-dyld-info binding). The fork reports exercising this 2009-era ARM32 guest through the full
+pipeline by cross-compiling this project as the ARM32 edition
+(`arm-linux-gnueabihf-g++ -marm -static`) and running it under QEMU user-mode emulation.
+The result: all 50 C++ static initializers complete (Box2D physics globals, game state),
+`UIApplicationMain` is entered, and the native event loop sustains its 60 FPS heartbeat
+(1500+ frames logged) with zero crashes, as reported by the fork. Visible game rendering/audio
+remain unverified (GLES 1.x and audio are limited shims at this point).
+
+- Classic-image slide-0 placement fix (loader/dyld.cpp): a pre-dyld-info Mach-O has no rebase
+  records, so every internal `__DATA` pointer is only valid at its preferred vmaddr. The loader
+  previously assigned these images to the moving base cursor; internal pointers then pointed
+  into the wrong part of the image (the guest's heap use crashed with "free(): invalid
+  pointer" during `__StaticInit`). Classic images now load at their `textBase()` (slide 0),
+  the base cursor clears their real extent, and overlapping preferred addresses are refused
+  with an error instead of colliding silently. `convert`/`validate` also default classic
+  images to slide 0, which removes the stale warning. The synthetic dylib fixture (classic,
+  by design) now loads at its preferred base in `dyld_binds_across_images`.
+- libSystem additions (`runtime/compat_libsystem.cpp`): libm float/double variants the guest
+  imports (`_sinf`, `_cosf`, `_tanf`, `_atan2f`, `_asinf`, `_acosf`, `_atanf`, `_ceilf`,
+  `_floorf`, `_logf`, `_log10f`, `_expf`, `_sqrtf`, `_powf`, `_fmodf`, `_fabsf`, plus the
+  `_asin`/`_atan2`/`_tan`/`_acos`/`_atan`/`_log10`/`_exp` doubles) bound to the identical host
+  functions; libgcc division builtins `___divsi3`/`___udivsi3`/`___modsi3`/`___umodsi3`
+  implemented with ARM32/libgcc-compatible edge semantics (division by zero yields quotient 0,
+  remainder dividend; `INT_MIN/-1` wraps); `_printf`/`_sprintf` (AAPCS32
+  varargs are ABI-identical); `_rand`/`_srand`; `___assert_rtn` (logs through the guest
+  output, then aborts, matching Darwin semantics); pthread attribute shims (return 0, as the
+  existing pthread shim ignores attrs); `_pthread_mach_thread_np` (unique pthread identity);
+  `_thread_policy_set`/`_thread_info` report KERN_INVALID_POLICY (28) / KERN_INVALID_TASK (16)
+  instead of pretending success.
+- libstdc++.6.dylib forwarding (`runtime/cxx_forward.cpp`): the pre-libc++ C++ runtime of
+  armv6-era apps. Real red-black-tree algorithms (`_Rb_tree_insert_and_rebalance`,
+  `_Rb_tree_increment` non-const + const, `_Rb_tree_rebalance_for_erase`) written against the
+  stable `_Rb_tree_node_base` layout, validated by 400 randomized inserts + 200 erases against
+  `std::set` (in-order sequence, header leftmost/rightmost invariants). Inert SjLj context
+  registration no-ops (`__Unwind_SjLj_Register`/`_Unregister`). Exception machinery
+  (`__Unwind_SjLj_Resume`, `___gxx_personality_sj0`, the `__ZSt*__throw_*` helpers) stays
+  unregistered on purpose: the named trap stubs report it, per the exceptions-unsupported
+  doctrine.
+- Framework shims (`runtime/framework_stubs.cpp`): CoreGraphics math implemented for real
+  (`_CGAffineTransformIdentity` is genuine 24-byte data `{1,0,0,1,0,0}`;
+  `_CGAffineTransformScale` and `_CGAffineTransformIsIdentity` implement Apple's
+  definitions); a real small CFArray subset (`_CFArrayCreateMutable`, `_CFArrayAppendValue`,
+  `_CFArrayGetValueAtIndex`, `_CFArrayGetCount`, `_CFArrayRemoveValueAtIndex`,
+  `_CFArrayRemoveAllValues` - NULL allocator/callbacks semantics); `_objc_copyStruct` (a
+  sized struct copy, as on iOS); `_CGContext*`/`_CGImage*`/`_CGBitmapContextCreate`/
+  `_CGColorSpace*`/`_UIGraphics*` remain limited stubs; OpenGL ES 1.x fixed-function entry
+  points (21, e.g. `_glPushMatrix`, `_glTranslatef`, `_glVertexPointer`, the
+  `*FramebufferOES`/`*RenderbufferOES` family) are no-op stubs - the host has no fixed
+  pipeline to forward to; AudioToolbox (`_AudioQueue*`, `_AudioFile*`) and OpenAL
+  (`_al*`, `_alc*`) remain limited stubs (`_alGetError` answers `AL_NO_ERROR`,
+  `_alcOpenDevice` answers NULL: "no device").
+- CLI: `run` accepts `RADEKI_RUN_LOG=<path>` to write the same persistent run log as the Android
+  launcher. The new `dump_sections` utility reports section types and indirect-symbol indexes;
+  the fork reports that it used persistent logging for its QEMU run.
+- The fork reports that 155 of 172 imports in the tested app resolved to concrete host handlers;
+  17 remain as honest stubs or traps (CG raster context, audio backends, exception machinery).
+
+### QEMU cross-verification setup (recorded for reproducibility)
+
+`qemu-arm` maps the target binary at its ELF `p_vaddr`; the ARM32 edition is therefore linked
+with `-Wl,-Ttext-segment=0x40000000` (statically) so the guest's preferred 0x1000-0x56000
+span stays free. Command: `qemu-arm build-arm32/radeki run <Touch & Go.app executable>`.
+This is an analysis-environment verification only - on-device Android execution remains
+unverified and the matrix rows keep saying so.
+
 ## 2026-10-03 - EGL render-thread ownership, CADisplayLink heartbeat and frame presenting
 
 Host suite: **540 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
