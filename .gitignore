@@ -1,2 +1,17 @@
+# Build artifacts
+/build/
+*.o
+*.a
+*.so
+*.apk
+
 # The source ships as RadekiOSNative.zip; the extracted working tree is local-only.
 /RadekiOSNative/
+
+# Gradle build artifacts
+/.gradle/
+/local.properties
+/.idea/
+*.iml
+/android/app/build/
+/android/build/

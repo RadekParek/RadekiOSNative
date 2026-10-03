@@ -1,0 +1,116 @@
+{
+  "schema": 1,
+  "environment": "x86_64 host, g++12, make; no NDK/cmake/clang/aarch64 cross/qemu/network",
+  "milestone1": {
+    "name": "synthetic ARM64 Mach-O -> analyzer -> relinker -> runtime -> native exec -> correct output",
+    "done": [
+      "synthetic ARM64 Mach-O generator",
+      "Mach-O parser",
+      "analyzer",
+      "relinker (slide, rebase, bind, trap stubs, veneers, validator)",
+      "CLI analyze/convert/validate",
+      "native runtime (mmap, W^X, signal-safe call into guest) + compat libSystem subset + JNI + guest-process service + on-device self-test button",
+      "Objective-C metadata reading (class_ro_t, methods in both encodings, ivars, properties, categories, protocols) - read-only",
+      "dyld-style image registry: multi-image load bases, dependency-first order, cross-image + re-export + flat binding, per-image unresolved reporting",
+      "runtime runs a whole linked image set in one reservation (multi-image entry point is ARM64-only, like the single-image path)",
+      "code-range based validation (section instruction attributes) + hostile-metadata fuzzing"
+    ],
+    "verified_on_host": "relinked image executed by a test-only AArch64 interpreter; cross-image binding verified structurally (bound slots land inside the provider image, zero trap stubs when a provider exists)",
+    "not_done": [
+      "runtime has NOT been executed on an ARM64 device or compiled with the NDK by me",
+      "ObjC runtime (dispatch, class registration, method lookup), Foundation, UIKit, graphics, audio, input",
+      "variadic functions (printf etc.): Apple passes varargs on the stack, so they need special shims",
+      "TLS: Apple uses TPIDRRO_EL0, thread-locals unsupported",
+      "pthread shims: static non-recursive mutexes only; Apple's pthread_attr_t layout is ignored"
+    ]
+  },
+  "tests": {
+    "checks": 486,
+    "failures": 0,
+    "run_with": [
+      "make test",
+      "make SAN=1 test"
+    ]
+  },
+  "milestone4": {
+    "name": "batch 3: libc++ forwarding, framework stubs, dispatch-stub linker mode",
+    "target": "Minecraft PE 0.10.4 ARM64 halt in __GLOBAL__I_a17 (SIGTRAP on unbound libc++/framework imports)",
+    "done": [
+      "cxx_forward: explicit std::__1 basic_string wrappers (init/ctors/dtor/assign/append/reserve/resize/insert/compare/npos) + ios_base::Init, registered under Apple's exact mangled names, grow-only storage policy matching libc++",
+      "cxx_forward: chained dlsym(RTLD_DEFAULT) pass-through for _Z-mangled imports from Apple C++ dylibs (finds identical std::__1 symbols in the NDK libc++ on device)",
+      "stub_dispatch: RW->RX trampoline arena + naked dispatcher returning safe defaults (0/NULL/nil, YES, x0 pass-through, empty SEL) with per-symbol logging; data imports get labelled dummy objects",
+      "framework_stubs: written shims (UIApplicationMain, NSLog, objc memory family, autorelease pools, selector helpers, CF basics) + ~80 dummy _OBJC_CLASS_$_/_OBJC_METACLASS_$_ objects + constants",
+      "relinker/loader: opt-in stubFactory binding mode (default stays honest BRK traps); stubbed imports stay listed unresolved with stub addresses, NOOP_STUB classification, linkAll warning",
+      "loader::Registry::resolve documents the full Apple-vs-host pipeline; makeHostRuntime() packages the layer; radeki run/JNI run use it (--traps/--stubs flags)",
+      "initializer tracing names each __mod_init_func entry in the compat-call log"
+    ],
+    "verified_on_host": "486 checks, 0 failures, ASan/UBSan clean; libc++ string and next-prime wrappers, fixed call-history ring, trampoline encodings and both linker modes covered",
+    "not_verified": [
+      "ARM64 device execution of trampolines (test exists, guarded to aarch64 hosts)",
+      "dlsym hits against the NDK libc++ (c++_static/c++_shared)",
+      "Minecraft PE 0.10.4 actually passing __GLOBAL__I_a17"
+    ]
+  },
+  "milestone5": {
+    "name": "libc++ hash-table prime helper and MCPE ChunkPos follow-up",
+    "target": "Device report: SIGSEGV in __hash_table<ChunkPos>::__insert_unique after an unbound __next_prime(size_t) import returned zero",
+    "done": [
+      "Added the exact Apple libc++ __next_prime mangled import to the explicit compatibility table; preserves the zero sentinel and otherwise returns the smallest prime at least the requested bucket count",
+      "Uses deterministic 64-bit Miller-Rabin with bounded runtime; covered from small requests through a near-SIZE_MAX prime case",
+      "Replaced hot-path compatibility-call deque/string allocations with a fixed-size ring and const-char overload; avoided duplicate compatibility-registry setup in runImage()",
+      "Kept UIKit status explicitly Unsupported and clarified that startup shims do not implement the app UI/event loop or render a boot screen"
+    ],
+    "verified_on_host": "486 checks, 0 failures, clean under make SAN=1 test (ASan + UBSan)",
+    "not_verified": [
+      "Android NDK/APK build unavailable in this environment",
+      "The exact wrapper has not yet been exercised on an ARM64 device against this game binary",
+      "The game has not reached its visible boot screen; real UIKit, app loop/surface, Foundation and graphics support remain incomplete"
+    ]
+  },
+  "known_gaps": [
+    "ARM64e auth fixups refused (PAC layer missing)",
+    "encrypted binaries refused (not decrypted)",
+    "weak-bind opcodes and exports trie not interpreted",
+    "lazy binds bound eagerly",
+    "Android APK is built by CI, but the app's native path has never been executed on a device or emulator by me",
+    "ObjC metadata is read-only: no dispatch, no class registration, no method lookup",
+    "loader has no dyld shared cache, no @rpath expansion, no initializer ordering across images, no weak coalescing",
+    "libSystem subset is ~60 symbols; pthread support is a static non-recursive shim",
+    "dispatch stubs and framework dummies keep calls alive and log them; they implement nothing (no rendering, no ObjC message dispatch), and C++ exceptions stay deliberately unsupported"
+  ],
+  "next_blocker": "Retest the reported __next_prime fix with the rebuilt APK on ARM64 and capture the next failure; reaching a visible boot screen still requires a real UIKit/Objective-C application loop, Android surface presentation, Foundation and graphics support. No device execution is available here. Other host-side work includes exports-trie/weak-bind support and a fuller Foundation/NSObject runtime.",
+  "milestone2": {
+    "name": "multi-image loading + Objective-C metadata reading",
+    "done": [
+      "loader/dyld.h|.cpp registry (resolve via two-level, re-export, flat; two-pass linkAll)",
+      "objc/objc.h|.cpp read-only metadata parser that never throws",
+      "CLI load/run commands and --objc dump; analyze reports ObjC counts",
+      "codeRange-based validation; --dylib repeatable"
+    ],
+    "coverage": "213 checks, 0 failures, ASan/UBSan clean; objc::parse must not throw, asserted by 3000 mutation iterations",
+    "not_done": [
+      "no dyld shared cache, no @rpath filesystem expansion, no cross-image initializer ordering, no weak coalescing",
+      "multi-image execution itself is unverified on hardware",
+      "ObjC metadata is not used to dispatch anything yet"
+    ]
+  },
+  "milestone3": {
+    "name": "batch 2 compatibility and IPA handling",
+    "verified_on_host": [
+      "344 checks, 0 failures",
+      "ASan/UBSan test suite",
+      "PNG/CgBI round trip; binary/XML plist; ZIP/DEFLATE decoders tested independently"
+    ],
+    "not_verified": [
+      "Android Gradle/NDK build (SDK/Gradle unavailable in host environment)",
+      "ARM64 device run",
+      "real-world IPA compatibility"
+    ],
+    "known_limitations": [
+      "Objective-C dispatch and UIKit absent",
+      "C++ exceptions/unwinding trap by symbol",
+      "thread atexit is process-wide",
+      "ZIP container extraction performed by Java ZipFile, not the C++ inflater"
+    ]
+  }
+}
