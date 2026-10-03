@@ -3,6 +3,58 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - libc++ forwarding, framework stubs and the dispatch-stub linker mode (batch 3)
+
+Host suite: **440 checks, 0 failures**, including an ASan/UBSan clean run. Targets the MCPE PE
+0.10.4 halt: the guest died in static construction (`__GLOBAL__I_a17`) with SIGTRAP because
+unmapped libc++/libSystem exports and missing iOS frameworks left its imports on BRK trap
+stubs. ARM64 device execution is still **not** verified here.
+
+- **libc++.1.dylib -> host C++ forwarding** (`runtime/cxx_forward.*`): a symbol mapping table
+  registered into the dyld relocation pass maps Apple's mangled C++ exports onto the host C++
+  runtime. Explicit wrappers speak Apple's ABI directly for `basic_string` allocation and
+  initialization - including the exact symbol from the halt log,
+  `__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm` - plus
+  constructors/destructors, `assign`/`append`/`reserve`/`resize`/`insert`/`compare`, `npos`
+  and `ios_base::Init`, with libc++'s grow-only storage policy. A chained
+  `dlsym(RTLD_DEFAULT)` resolver catches remaining `_Z`-mangled imports from Apple C++ dylibs
+  (on Android that finds the identical std::__1 symbols in the NDK libc++).
+- **Dispatch-stub linker mode** (`runtime/stub_dispatch.*`, `relinker::LinkOptions::stubFactory`,
+  `loader::Options::stubFactory`): opt-in; the 446-import class of unbound strong imports is no
+  longer forced onto BRK/SIGTRAP trap stubs. Code imports bind to per-symbol 32-byte AArch64
+  trampolines in an RW->RX arena that branch to a shared naked dispatcher; it logs the symbol
+  (first call always, then sampled) and returns a safe default: 0/NULL/nil, YES/1, the caller's
+  x0 (objc retain family / objc_msgSend pass-through) or an empty SEL. Data imports bind to
+  labelled dummy objects. Default behaviour is unchanged: honest named BRK traps, and every
+  stubbed import stays listed in `LoadResult::unresolved` (with its stub address in the new
+  `UnresolvedImport::stub`) and classified `NOOP_STUB` - stubs never fake success.
+- **Framework stub layer** (`runtime/framework_stubs.*`): minimal dummy structures/wrappers so
+  the startup loop can complete - written shims for `_UIApplicationMain` (returns 0 = completed
+  startup), `_NSLog`, the objc memory family, autorelease pools, selector helpers and CF basics;
+  `DummyFrameworkClass`/`DummyEAGLContext`/`DummyEAGLSharegroup`/`DummyUIApplication` backing
+  ~80 `_OBJC_CLASS_$_`/`_OBJC_METACLASS_$_` imports across UIKit, EAGL, QuartzCore, Foundation,
+  AVFoundation and StoreKit; labelled zero blocks for `_NSConcreteStackBlock`, `kCFAllocator*`,
+  notification names and similar constants.
+- **Loader architecture**: `Registry::resolve()` now documents and implements the full Apple-vs-
+  host pipeline (two-level guest images -> flat -> host runtime layer -> unresolved policy);
+  `makeHostRuntime()` packages registry + dlsym chain + stub factory for `run` paths. `radeki
+  run` and the JNI `run` use it by default (`--traps` restores trap stubs); `load`/`symbols`
+  take `--stubs` to preview the mode. New `NOOP_STUB` classification, `RunResult`/
+  `MultiRunResult::dispatchStubs`, initializer tracing names each `__mod_init_func` entry.
+- **Tests**: +94 checks covering the wrapper ABI against the documented libc++ layout (SSO,
+  long mode, grow-only policy, leak-free under ASan), trampoline encodings, dispatcher return
+  kinds, both linker modes, honest reporting and determinism across the two link passes, and a
+  live-execution test of the trampolines guarded to ARM64 hosts.
+
+### Limits, stated plainly
+- No Objective-C dispatch, no GLES/UIKit implementation: stubs keep the loop alive, they do
+  not render anything; the compatibility state machine still reports `PARTIALLY_RELINKED` when
+  stubs are in use.
+- C++ exceptions/unwinding remain unsupported on purpose (`__cxa_throw` etc. stay unregistered;
+  with the stub factory they become logging stubs, which is visible but not correct).
+- dlsym hits against the NDK libc++ and the whole device path are unverified in this
+  environment; host verification is link- and ABI-level only.
+
 ## 2026-10-03 - honest compatibility status, C++ shims and offline IPA import (batch 2)
 
 Host suite: **344 checks, 0 failures**, including an ASan/UBSan clean run. Android/NDK builds
