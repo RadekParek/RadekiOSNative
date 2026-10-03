@@ -3,6 +3,38 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - PoolAllocator libc++ string fix, POSIX sandbox & EAGL/GLESv2 bridge (batch 4)
+
+Host suite: **473 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan). Targets the
+Minecraft PE 0.10.4 `PoolAllocator` / `mod_init` `SIGSEGV` at `faultAddr: 0x10`, sets up POSIX
+external storage sandboxing under `/storage/emulated/0/RadekiOSNative/sandbox/`, and prepares the
+minimal UIKit / EAGL / OpenGL ES 2.0 rendering bridge.
+
+- **libc++ `basic_string` manipulation & non-null `this` returns** (`runtime/cxx_forward.*`,
+  `runtime/stub_dispatch.cpp`): added host implementations for
+  `__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc`
+  (`std::string::insert(size_type, const char*)`) and full overload sets for `insert`,
+  `push_back`, `append`, `assign`, `reserve`, `resize`, `replace`, `erase`, `operator=`,
+  `__grow_by_and_replace`, and `__grow_by`. Mutating methods now return `GuestStdString*` (`this`
+  in `x0`) matching the ARM64 Itanium ABI instead of `void` or `0`, resolving the `faultAddr: 0x10`
+  null-reference read (`[x0, #0x10]`) in `PoolAllocator` and `mod_init`. Fixed `HostCxxResolver`
+  Mach-O `__Z` -> ELF `_Z` symbol stripping for `dlsym`.
+- **POSIX external storage sandboxing** (`runtime/compat_libsystem.cpp`, `runtime/runtime.*`):
+  dynamic guest-to-sandbox path translation rooted at
+  `/storage/emulated/0/RadekiOSNative/sandbox/` with boot-time creation of `Documents/`,
+  `Library/Application Support/`, `Library/Caches/`, and `tmp/`. Intercepts C/POSIX file calls
+  (`open`, `fopen`, `stat`/`lstat`/`fstat` with 144-byte Darwin ARM64 `struct stat` translation,
+  `mkdir`, `access`, `chdir`, `getcwd`, `unlink`, `remove`, `rename`, `rmdir`, `opendir`) and
+  Foundation path functions (`NSHomeDirectory`, `NSSearchPathForDirectoriesInDomains`,
+  `NSTemporaryDirectory`).
+- **Minimal UIKit & EAGL OpenGL ES 2.0 bridge** (`runtime/framework_stubs.*`,
+  `android/app/src/main/cpp/CMakeLists.txt`): implemented `EAGLContext` (`initWithAPI:`,
+  `setCurrentContext:`, `currentContext`, `presentRenderbuffer:`,
+  `renderbufferStorage:fromDrawable:`), `UIWindow` (`makeKeyAndVisible`), and `CADisplayLink`
+  (`displayLinkWithTarget:selector:`, `addToRunLoop:forMode:`) bindings via a selector-aware
+  `_objc_msgSend` shim, and forwarded OpenGL ES 2.0 entry points (`_gl*`) to Android's native
+  `libEGL.so` / `libGLESv2.so` with safe context-free fallbacks.
+
 ## 2026-10-03 - libc++ forwarding, framework stubs and the dispatch-stub linker mode (batch 3)
 
 Host suite: **440 checks, 0 failures**, including an ASan/UBSan clean run. Targets the MCPE PE
