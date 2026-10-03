@@ -27,9 +27,6 @@ jobs:
         with: { name: radeki-android-arm64, path: build-android/radeki }
   apk:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -46,25 +43,15 @@ jobs:
           set -o pipefail
           gradle -p android assembleDebug --no-daemon --stacktrace --console=plain 2>&1 \
             | tee "$RUNNER_TEMP/gradle.log"
+      # Failing Gradle output is otherwise buried in the job log; surface the first errors as
+      # annotations so they show up on the run itself (and on the PR's checks).
       - name: Report the first build errors
         if: failure()
         run: |
-          grep -aA 4 -E 'error:|error \[|FAILURE:|What went wrong|Caused by:|Execution failed|CMake Error' \
+          grep -aA 4 -E 'error:|error \[|FAILURE:|What went wrong|Execution failed|CMake Error|ninja: error' \
             "$RUNNER_TEMP/gradle.log" | head -60 > "$RUNNER_TEMP/excerpt.txt" || true
           test -s "$RUNNER_TEMP/excerpt.txt" || tail -40 "$RUNNER_TEMP/gradle.log" > "$RUNNER_TEMP/excerpt.txt"
           while IFS= read -r line; do echo "::error::$line"; done < "$RUNNER_TEMP/excerpt.txt"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            {
-              echo "Android build failed for \`${{ github.sha }}\`:"
-              echo '```'
-              head -40 "$RUNNER_TEMP/excerpt.txt"
-              echo '```'
-            } > "$RUNNER_TEMP/comment.md"
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file "$RUNNER_TEMP/comment.md" \
-              --repo "$GITHUB_REPOSITORY" || true
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
       - name: Stage and verify the APK
         run: |
           cp android/app/build/outputs/apk/debug/app-debug.apk RadekiOSNative.apk

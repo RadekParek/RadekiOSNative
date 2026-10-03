@@ -25,10 +25,17 @@ Host suite: **487 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UB
   `tools/make_source_zip.sh` now rebuilds the archive from the tree (top-level `RadekiOSNative/`,
   without `CHANGELOG.md` and without the archive itself), and the refreshed archive carries the
   fixed workflow.
-- No C++ or Java source changed, and `host` / `android-arm64` are untouched. The APK is confirmed
-  by the CI `apk` job itself: no NDK/Android SDK is installed in the environment where this fix
-  was prepared, so the host suite and the APK verification steps (exercised here against
-  synthetic APKs, positive and negative) are all that could be run locally.
+- Restarting the job immediately exposed why the batch-6 game sources had never been verified:
+  `GameActivity.java` called `ev.getY(idx())`, so javac failed the APK build with
+  `cannot find symbol: method idx()`. The single line is corrected to `ev.getY(idx)`; the touch
+  forwarding itself is unchanged. This is the only Java/C++ change here.
+- The `apk` job now also reports Gradle/javac errors as workflow annotations (a failing build
+  otherwise keeps them buried in the job log). `host` and `android-arm64` are untouched.
+- No C++ source changed. The final APK (with the JNI library inside) is confirmed by the CI
+  `apk` job itself: no NDK/Android SDK is installed in the environment where this fix was
+  prepared, so the host suite, the `-fsyntax-only` sweep of every Android target source with
+  simulated Android headers, and the APK verification logic (exercised against synthetic APKs,
+  positive and negative) are what could be run locally.
 
 ## 2026-10-03 - Android CLI link fix (missing liblog)
 
