@@ -14,7 +14,7 @@ Native-first iOS -> Android ARM64 / ARMv7 compatibility foundation. Matching gue
 - Verification: a test-only mini AArch64 interpreter runs a relinked synthetic image and checks output; cross-image binding is verified structurally (bound pointers land inside the provider image, no trap stubs left).
 
 ## Not done (see progress.json / capabilities.json)
-The Android ARM64 and ARM32 editions are configured for native builds, but device execution has not been verified. ARMv7 has initial pointer relinking, a 32-bit trap stub and a minimal self-test; branch rewriting, code validation, full 32-bit system-ABI coverage and real-game startup still need work. ARM64e PAC, a functional Objective-C runtime (message dispatch/class registration), full Foundation/UIKit, CoreFoundation/CoreGraphics/QuartzCore, Metal/GLES/Vulkan game rendering, audio, input, networking and complete filesystem compatibility remain incomplete.
+CI successfully built and verified the Android ARM64 and ARM32 APKs, but guest execution on real devices remains unverified. ARMv7 has initial pointer relinking, a 32-bit trap stub and a minimal self-test; branch rewriting, code validation, full 32-bit system-ABI coverage and real-game startup still need work. ARM64e PAC, a functional Objective-C runtime (message dispatch/class registration), full Foundation/UIKit, CoreFoundation/CoreGraphics/QuartzCore, Metal/GLES/Vulkan game rendering, audio, input, networking and complete filesystem compatibility remain incomplete.
 The loader has no dyld shared cache, no `@rpath`/`@executable_path` expansion against a filesystem, no cross-image initializer ordering and no weak-symbol coalescing. Encrypted (FairPlay) binaries are refused; the tool does not decrypt anything.
 
 ## Build
@@ -46,8 +46,8 @@ per-slot classification. `radeki ipa` inspects an extracted `.app`, reads its In
 converts an icon **from that bundle** to standard `icon.png`. No downloading or guessed icons.
 The Android library stores imported bundles and native JSON analysis; separate ARM64 and ARM32
 editions require an ABI-matching device/process, and game compatibility is not promised. RTLS is
-opt-in; normal launch logs persist independently. CI is configured to build both APK flavors,
-but actual Android device execution remains unverified.
+opt-in; normal launch logs persist independently. CI has built and checked both APK flavors;
+actual Android device execution remains unverified.
 
 ## Batch 3: libc++ forwarding, framework stubs and dispatch stubs
 Targets the Minecraft PE 0.10.4 halt in `__GLOBAL__I_a17` (SIGTRAP on unbound libc++/framework

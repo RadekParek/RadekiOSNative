@@ -6,7 +6,8 @@ file is the channel log for that artifact and lives beside it in the repository 
 ## 2026-10-03 - Persistent run diagnostics, opt-in RTLS and ARM32 edition
 
 Host suite: **518 checks, 0 failures**, clean under `make SAN=1 test` after a clean rebuild.
-Both Android APK flavors still need the GitHub CI build/verification before this task is complete.
+The ARM64 and ARM32 debug APKs, native CLI builds, and host tests passed GitHub Actions run
+[37125335912](https://github.com/RadekParek/RadekiOSNative/actions/runs/37125335912); device execution remains unverified.
 
 - Added private persistent per-run logs, a recent-run history, a latest-run card, and a scrollable
   copy/share viewer. Native logs retain guest output, run-stage messages, graphics/Surface state,
@@ -23,8 +24,9 @@ Both Android APK flavors still need the GitHub CI build/verification before this
   synthetic ARM32 entrypoint self-test. Branch rewriting and PC-relative validation remain
   unsupported; matching 32-bit and 64-bit images cannot be mixed in one process.
 - Added separate `arm64-v8a` and `armeabi-v7a` Gradle flavors and CI jobs that build both APKs,
-  verify their packaged JNI libraries and publish both editions as release assets. The local
-  environment has no Java/Gradle/Android SDK/NDK, so actual APK verification is pending CI.
+  verify their packaged JNI libraries and publish both editions as release assets. CI run
+  `37125335912` succeeded for the host suite, both NDK CLI builds, both APK variants and the
+  APK-content checks; real-device guest execution remains a separate unverified step.
 
 ## 2026-10-03 - Restore the APK build (the workflow had lost its `apk` and `release` jobs)
 
