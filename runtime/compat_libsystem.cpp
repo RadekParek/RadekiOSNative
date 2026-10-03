@@ -828,8 +828,12 @@ bool c_cxx_shared_weak_count_release_shared(void* self) {
   auto* cnt = static_cast<SharedWeakCountLayout*>(self);
   uintptr_t selfAddr = reinterpret_cast<uintptr_t>(self);
   uintptr_t vtAddr = reinterpret_cast<uintptr_t>(cnt->vtable);
-  constexpr uintptr_t kLo = 0x100000ull;
+  constexpr uintptr_t kLo = 0x100000u;
+#if UINTPTR_MAX > UINT32_MAX
   constexpr uintptr_t kHi = 0x00007FFFFFFFFFFFull;
+#else
+  constexpr uintptr_t kHi = UINTPTR_MAX;
+#endif
   if (hostFn && selfAddr > kLo && selfAddr < kHi && vtAddr > kLo && vtAddr < kHi) {
     return hostFn(self);
   }

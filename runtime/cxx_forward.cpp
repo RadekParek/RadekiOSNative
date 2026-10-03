@@ -697,11 +697,18 @@ void* w_ios_init_dtor(void* self) { noteCompatCall("std::ios_base::Init::~Init")
 // Preserve libc++'s n==0 empty-table sentinel; otherwise return the smallest prime >= the
 // requested bucket count. Deterministic Miller-Rabin keeps pathological size_t inputs bounded
 // instead of allowing a trial-division shim to spend billions of iterations on a large request.
+#if UINTPTR_MAX > UINT32_MAX
 using WideUInt = unsigned __int128;
-
 uint64_t multiplyModulo(uint64_t a, uint64_t b, uint64_t modulus) {
   return static_cast<uint64_t>((static_cast<WideUInt>(a) * b) % modulus);
 }
+#else
+// ARMv7's size_t is 32-bit, so both operands are at most UINT32_MAX and their product fits
+// exactly in uint64_t. This keeps the same Miller-Rabin wrapper usable without ARMv7 int128.
+uint64_t multiplyModulo(uint64_t a, uint64_t b, uint64_t modulus) {
+  return (a * b) % modulus;
+}
+#endif
 
 uint64_t powerModulo(uint64_t base, uint64_t exponent, uint64_t modulus) {
   uint64_t result = 1;
