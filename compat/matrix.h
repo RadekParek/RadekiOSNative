@@ -8,7 +8,7 @@ struct Detected {
   bool linked = false;
   size_t unresolvedStrong = 0, unresolvedWeak = 0;
   bool objc = false, gles = false, metal = false, audio = false, networking = false;
-  bool swift = false, arm64e = false, armv7 = false, encrypted = false;
+  bool swift = false, arm64e = false, armv7 = false, hostArm32 = false, encrypted = false;
   bool uikit = false, corefoundation = false, vulkan = false, input = false;
   std::string blockedReason;
 };

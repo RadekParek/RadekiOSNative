@@ -78,6 +78,12 @@ TEST(fat_and_selection) {
   CHECK(sl.size() == 2 && sl[0].arch == macho::Arch::ARM64 && sl[1].arch == macho::Arch::ARMv7);
   auto ch = macho::chooseSlice(sl);
   CHECK(ch.index && *ch.index == 0);
+  auto hostChoice = macho::chooseSliceForHost(sl);
+#if defined(__arm__) && !defined(__aarch64__)
+  CHECK(hostChoice.index && *hostChoice.index == 1);
+#else
+  CHECK(hostChoice.index && *hostChoice.index == 0);
+#endif
   auto only32 = macho::chooseSlice({sl[1]});
   CHECK(only32.index && *only32.index == 0);
   auto x86 = macho::chooseSlice({macho::SliceInfo{macho::Arch::X86_64, 0x01000007, 3, 0, 0, true, false}});
@@ -176,6 +182,41 @@ TEST(link_and_execute) {
     CHECK(cpu.out == "hello radeki\nhello radeki\n");
     CHECK(cpu.trap.empty());
   }
+}
+
+TEST(arm32_parse_and_link) {
+  auto bytes = synth::buildArm32Test();
+  auto img = macho::parseFile(bytes);
+  CHECK(img.arch == macho::Arch::ARMv7 && !img.is64);
+  auto report = analysis::analyze(img);
+#if !defined(__arm__) || defined(__aarch64__)
+  CHECK(!report.blockers.empty() && report.blockers.front().find("separate 32-bit ARM process") != std::string::npos);
+#else
+  CHECK(report.blockers.empty());
+#endif
+  CHECK(img.entry && *img.entry == 0x1200);
+  CHECK(img.fixups.size() == 2 && img.imports.size() == 1);
+  CHECK(img.imports[0].name == "_missing_fn");
+  CHECK(relinker::pageSizeForArch(img.arch) == relinker::kArm32PageSize);
+
+  relinker::LinkOptions opt;
+  opt.loadBase = 0x10001000;  // ARMv7's 4K page alignment, deliberately not ARM64's 16K alignment
+  auto linked = relinker::link(img, opt);
+  CHECK(linked.arch == macho::Arch::ARMv7);
+  CHECK(linked.imageSize == 0x3000 && linked.totalSize == 0x4000);
+  CHECK(linked.entry && *linked.entry == 0x10001200);
+  CHECK(linked.read32(0x10002004) == 0x10001200); // 32-bit rebased pointer
+  CHECK(linked.traps.size() == 1 && linked.traps[0].symbol == "_missing_fn");
+  CHECK(linked.read32(0x10002000) == linked.traps[0].addr);
+  CHECK(linked.read32(linked.traps[0].addr) == 0xE1200070); // A32 BKPT #0
+  CHECK(!relinker::validate(linked).warnings.empty()); // AArch32 instruction scan is explicitly unimplemented
+
+  relinker::LinkOptions unaligned = opt;
+  unaligned.loadBase = 0x10001004;
+  THROWS(relinker::LinkError, relinker::link(img, unaligned));
+  relinker::LinkOptions outOfRange = opt;
+  outOfRange.loadBase = 0x100000000ull;
+  THROWS(relinker::LinkError, relinker::link(img, outOfRange));
 }
 
 TEST(unresolved_import_traps_with_symbol) {
@@ -572,6 +613,35 @@ TEST(compat_and_runtime) {
   CHECK(runtime::runImage(timg).error.find("thread-local") != std::string::npos);
 }
 
+TEST(durable_run_logging) {
+  std::filesystem::path path = std::filesystem::temp_directory_path() / "radeki-rtls-test.log";
+  std::filesystem::remove(path);
+  runtime::beginRunLog(path.string(), true);
+  runtime::logRunEvent("surface bound for test");
+  runtime::noteCompatCall("test-selector");
+  runtime::appendGuestOutput("guest says hello\\n");
+  runtime::endRunLog();
+  std::ifstream input(path, std::ios::binary);
+  std::string enabled((std::istreambuf_iterator<char>(input)), {});
+  CHECK(enabled.find("RTLS connected") != std::string::npos);
+  CHECK(enabled.find("surface bound for test") != std::string::npos);
+  CHECK(enabled.find("compat call: test-selector") != std::string::npos);
+  CHECK(enabled.find("guest says hello") != std::string::npos);
+
+  std::filesystem::remove(path);
+  runtime::beginRunLog(path.string(), false);
+  runtime::noteCompatCall("rtls-disabled-selector");
+  runtime::appendGuestOutput("baseline output\\n");
+  runtime::endRunLog();
+  std::ifstream baselineInput(path, std::ios::binary);
+  std::string baseline((std::istreambuf_iterator<char>(baselineInput)), {});
+  CHECK(baseline.find("compat call: rtls-disabled-selector") == std::string::npos);
+  CHECK(baseline.find("baseline output") != std::string::npos);
+  std::filesystem::remove(path);
+  runtime::takeGuestOutput();
+  runtime::resetRecentCompatCalls();
+}
+
 TEST(json_writer) {
   JsonWriter j;
   j.beginObject().kv("a", "x\"y").key("l").beginArray().num(1).num(-2).endArray().kvh("h", 255).kvb("b", true).endObject();
@@ -660,6 +730,13 @@ TEST(batch2_status_and_cxx) {
   Detected app;app.linked=true;app.uikit=true;CHECK(stateFor(app)==RuntimeState::Relinked);
   CHECK(summaryFor(app).find("unsupported: UIKit")!=std::string::npos);
   for(const auto& row:capabilityMatrix())CHECK(!row.title.empty() && !row.detail.empty() && !row.subsystem.empty());
+  Detected nativeArmv7; nativeArmv7.linked=true; nativeArmv7.armv7=true; nativeArmv7.hostArm32=true;
+  CHECK(stateFor(nativeArmv7)==RuntimeState::RuntimePartial); // no AOT blocker when running in the matching 32-bit process
+  auto nativeRows=neededCapabilities(nativeArmv7);
+  CHECK(std::none_of(nativeRows.begin(),nativeRows.end(),[](const Capability& row){return row.id=="armv7_aot";}));
+  Detected mismatchedArmv7; mismatchedArmv7.linked=true; mismatchedArmv7.armv7=true;
+  CHECK(stateFor(mismatchedArmv7)==RuntimeState::Relinked);
+  CHECK(summaryFor(mismatchedArmv7).find("ARMv7 guest edition")!=std::string::npos);
 }
 
 TEST(batch2_loader_classification) {
@@ -762,6 +839,10 @@ TEST(cxx_forward_string_wrappers) {
   CHECK(runtime::cxxForwardTable().size() >= 20);
   CHECK(runtime::lookupCxxForward(S + "D1Ev").has_value());
   CHECK(!runtime::lookupCxxForward("__ZNSt3__1not_a_symbol").has_value());
+  CHECK(runtime::arm32ManglingAlias(S + "6__initEPKcm") == S + "6__initEPKcj");
+  CHECK(runtime::arm32ManglingAlias(S + "6__initEPKcmm") == S + "6__initEPKcjj");
+  CHECK(runtime::arm32ManglingAlias(S + "7compareEPKc") == S + "7compareEPKc");
+  CHECK(runtime::arm32ManglingAlias("__ZNSt3__112__next_primeEm") == "__ZNSt3__112__next_primeEj");
 
   // The MCPE crash reached libc++'s __hash_table::__insert_unique and called this import.
   // It must return the next usable bucket prime instead of falling through to a zero stub.
@@ -1124,11 +1205,11 @@ TEST(sandbox_and_eagl_gles_bridge) {
 
 int main() {
   bytes_bounds(); arm64_encodings(); fat_and_selection(); parse_dyld_info(); parse_chained(); malformed_inputs();
-  analysis_report(); link_and_execute(); unresolved_import_traps_with_symbol(); link_refusals(); branch_veneer();
+  analysis_report(); link_and_execute(); arm32_parse_and_link(); unresolved_import_traps_with_symbol(); link_refusals(); branch_veneer();
   validator_catches_escape(); objc_metadata(); objc_metadata_hostile_inputs(); objc_metadata_after_link();
   dyld_binds_across_images(); dyld_flat_namespace_late_provider(); dyld_keeps_unresolved_imports_honest();
   dyld_error_reporting(); dyld_run_loaded_images();
-  compat_and_runtime(); batch2_status_and_cxx(); batch2_loader_classification(); batch2_ipa(); mutation_fuzz_no_crash(); json_writer();
+  compat_and_runtime(); durable_run_logging(); batch2_status_and_cxx(); batch2_loader_classification(); batch2_ipa(); mutation_fuzz_no_crash(); json_writer();
   cxx_forward_string_wrappers(); stub_dispatch_trampolines(); relinker_dispatch_stub_mode();
   dyld_stub_mode_honest_reporting(); host_runtime_layer(); run_image_stub_mode();
   sandbox_and_eagl_gles_bridge();

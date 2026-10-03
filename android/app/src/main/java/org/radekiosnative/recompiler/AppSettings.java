@@ -3,11 +3,12 @@ package org.radekiosnative.recompiler;
 import android.content.Context;
 import android.content.SharedPreferences;
 
-/** Persisted controls that are passed to the native ARM64 guest runtime. */
+/** Persisted controls that are passed to the native guest runtime. */
 public final class AppSettings {
     private static final String FILE = "runtime_settings";
     private static final String ARM64_COMPATIBILITY = "arm64.compatibility_fallbacks";
     private static final String ARM64_TRACE_MISSING_APIS = "arm64.trace_missing_apis";
+    private static final String REALTIME_LOGGING = "diagnostics.realtime_logging";
 
     private AppSettings() {}
 
@@ -31,5 +32,14 @@ public final class AppSettings {
 
     public static void setArm64TraceMissingApis(Context context, boolean enabled) {
         preferences(context).edit().putBoolean(ARM64_TRACE_MISSING_APIS, enabled).apply();
+    }
+
+    /** RTLS is opt-in; ordinary run summaries and fatal diagnostics are always retained. */
+    public static boolean useRealtimeLogging(Context context) {
+        return preferences(context).getBoolean(REALTIME_LOGGING, false);
+    }
+
+    public static void setRealtimeLogging(Context context, boolean enabled) {
+        preferences(context).edit().putBoolean(REALTIME_LOGGING, enabled).apply();
     }
 }

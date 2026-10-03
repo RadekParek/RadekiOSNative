@@ -7,8 +7,12 @@ import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Process;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
@@ -37,58 +41,167 @@ import java.util.zip.ZipFile;
 
 public class MainActivity extends Activity {
     private static final int PICK=1;
-    private static final int BG=Color.rgb(5,6,8),SURFACE=Color.rgb(18,22,28);
-    private static final int TEXT=Color.rgb(232,234,237),DIM=Color.rgb(154,163,173),ACCENT=Color.rgb(79,140,255);
+    private static final int BG=Color.rgb(10,13,21),SURFACE=Color.rgb(20,26,38);
+    private static final int TEXT=Color.rgb(239,242,249),DIM=Color.rgb(161,173,193),ACCENT=Color.rgb(111,143,255);
     private final List<JSONObject> games=new ArrayList<>();
     private LinearLayout cards;
+    private LinearLayout latestLogCard;
+    private ScrollView homeScroll;
     private Library library;
+    private String autoPromptedLogId = "";
     private int dp(int n){return Math.round(getResources().getDisplayMetrics().density*n);}
     private TextView label(String text,int size,int color){TextView v=new TextView(this);v.setText(text);v.setTextSize(size);v.setTextColor(color);return v;}
     @Override protected void onCreate(Bundle state){
         super.onCreate(state);library=new Library(this);
-        ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);scroll.setBackgroundColor(BG);
-        LinearLayout root=new LinearLayout(this);root.setPadding(dp(20),dp(38),dp(20),dp(20));root.setOrientation(LinearLayout.VERTICAL);
+        ScrollView scroll=new ScrollView(this);homeScroll=scroll;scroll.setFillViewport(true);scroll.setBackgroundColor(BG);
+        LinearLayout root=new LinearLayout(this);root.setPadding(dp(20),dp(26),dp(20),dp(28));root.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(root);
+
         LinearLayout appBar=new LinearLayout(this);appBar.setOrientation(LinearLayout.HORIZONTAL);
         appBar.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout brand=new LinearLayout(this);brand.setOrientation(LinearLayout.VERTICAL);
-        brand.addView(label("RadekiOSNative",25,TEXT));
-        brand.addView(label("Native iOS compatibility runtime",13,DIM));
+        TextView name=label("RadekiOSNative",25,TEXT);name.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+        brand.addView(name);
+        brand.addView(label("iOS game compatibility · native runtime",13,DIM));
         appBar.addView(brand,new LinearLayout.LayoutParams(0,-2,1));
-        Button settings=new Button(this);settings.setText("⚙ SETTINGS");settings.setTextColor(Color.WHITE);
-        settings.setContentDescription("Runtime settings");
+        Button settings=new Button(this);settings.setText("SETTINGS");settings.setTextColor(Color.WHITE);
+        settings.setContentDescription("Runtime and logging settings");
         settings.setBackgroundTintList(ColorStateList.valueOf(ACCENT));
         settings.setOnClickListener(v->showSettings());
         appBar.addView(settings,new LinearLayout.LayoutParams(-2,dp(44)));
         root.addView(appBar);
-        LinearLayout header=new LinearLayout(this);header.setPadding(0,dp(32),0,dp(12));
-        TextView title=label("LIBRARY",13,DIM);header.addView(title,new LinearLayout.LayoutParams(0,dp(48),1));
-        Button add=new Button(this);add.setText("[ + ADD IPA ]");add.setTextColor(ACCENT);
+
+        LinearLayout hero=new LinearLayout(this);hero.setOrientation(LinearLayout.VERTICAL);
+        hero.setPadding(dp(18),dp(18),dp(18),dp(16));hero.setBackground(rounded(SURFACE,20,Color.rgb(42,53,76)));
+        TextView tag=label(runtimeEditionTitle(),12,ACCENT);tag.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+        hero.addView(tag);
+        TextView heroTitle=label("Your game library",22,TEXT);heroTitle.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+        heroTitle.setPadding(0,dp(6),0,0);hero.addView(heroTitle);
+        TextView heroCopy=label("Import an IPA, review compatibility notes, then launch with a saved diagnostic log.",13,DIM);
+        heroCopy.setPadding(0,dp(4),0,dp(12));hero.addView(heroCopy);
+        LinearLayout primaryActions=new LinearLayout(this);primaryActions.setOrientation(LinearLayout.HORIZONTAL);
+        Button add=new Button(this);add.setText("＋  IMPORT IPA");add.setTextColor(Color.WHITE);
+        add.setBackgroundTintList(ColorStateList.valueOf(ACCENT));
         add.setOnClickListener(v->{Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT);i.addCategory(Intent.CATEGORY_OPENABLE);
-            i.setType("*/*");startActivityForResult(i,PICK);});header.addView(add);
-        root.addView(header);cards=new LinearLayout(this);cards.setOrientation(LinearLayout.VERTICAL);root.addView(cards);
-        Button self=new Button(this);self.setText("Run built-in ARM64 self-test");
-        self.setOnClickListener(v->launch(null,"Self-test"));root.addView(self);
+            i.setType("*/*");startActivityForResult(i,PICK);});
+        primaryActions.addView(add,new LinearLayout.LayoutParams(0,dp(48),1));
+        Button self=new Button(this);self.setText("RUN SELF-TEST");self.setTextColor(ACCENT);
+        self.setOnClickListener(v->launch(null,"Self-test",isArm32Edition()?"ARMv7 self-test":"ARM64 self-test"));
+        LinearLayout.LayoutParams selfParams=new LinearLayout.LayoutParams(0,dp(48),1);selfParams.leftMargin=dp(8);
+        primaryActions.addView(self,selfParams);hero.addView(primaryActions);
+        root.addView(hero,new LinearLayout.LayoutParams(-1,-2));
+
+        latestLogCard=new LinearLayout(this);latestLogCard.setOrientation(LinearLayout.VERTICAL);
+        latestLogCard.setPadding(dp(16),dp(14),dp(16),dp(12));
+        latestLogCard.setBackground(rounded(SURFACE,18,Color.rgb(36,46,65)));
+        LinearLayout.LayoutParams logParams=new LinearLayout.LayoutParams(-1,-2);logParams.topMargin=dp(14);
+        root.addView(latestLogCard,logParams);
+
+        LinearLayout header=new LinearLayout(this);header.setPadding(0,dp(26),0,dp(8));header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title=label("IMPORTED GAMES",12,DIM);title.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+        header.addView(title,new LinearLayout.LayoutParams(0,dp(44),1));
+        Button history=new Button(this);history.setText("RUN HISTORY");history.setTextColor(ACCENT);
+        history.setOnClickListener(v->showRunHistory());header.addView(history);
+        root.addView(header);
+        cards=new LinearLayout(this);cards.setOrientation(LinearLayout.VERTICAL);root.addView(cards);
+
         setContentView(scroll);refresh();
+    }
+
+    private GradientDrawable rounded(int color,int radiusDp,int strokeColor){
+        GradientDrawable drawable=new GradientDrawable();drawable.setColor(color);
+        drawable.setCornerRadius(dp(radiusDp));if(strokeColor!=0)drawable.setStroke(dp(1),strokeColor);
+        return drawable;
+    }
+
+    private boolean isArm32Edition(){
+        return BuildConfig.FLAVOR != null && BuildConfig.FLAVOR.contains("arm32");
+    }
+    private String runtimeEditionTitle(){
+        return isArm32Edition()
+                ? "ARM32 EDITION  ·  ARMv7 / AArch32" : "ARM64 EDITION  ·  arm64-v8a";
+    }
+
+    @Override protected void onResume(){
+        super.onResume();
+        if(latestLogCard==null)return;
+        updateLatestRunCard();
+        File latest=RunHistory.latest(this);
+        if(latest!=null&&!latest.getName().equals(autoPromptedLogId)&&RunHistory.shouldShowLatest(this)){
+            autoPromptedLogId=latest.getName();
+            latestLogCard.postDelayed(()->{
+                if(!isFinishing()){
+                    RunHistory.markViewed(this,latest);
+                    RunLogViewer.show(this,latest);
+                    updateLatestRunCard();
+                }
+            },350);
+        }
+    }
+
+    private void updateLatestRunCard(){
+        if(latestLogCard==null)return;
+        latestLogCard.removeAllViews();
+        File latest=RunHistory.latest(this);
+        TextView heading=label("LATEST RUN",12,ACCENT);heading.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+        latestLogCard.addView(heading);
+        if(latest==null){
+            latestLogCard.addView(label("No launches yet. A run log is created automatically for every game.",13,DIM));
+            return;
+        }
+        String state=RunHistory.status(latest);
+        TextView summary=label(RunHistory.title(latest)+"  ·  "+state,16,TEXT);
+        summary.setTypeface(Typeface.DEFAULT,Typeface.BOLD);summary.setPadding(0,dp(5),0,dp(4));
+        latestLogCard.addView(summary);
+        TextView path=label(latest.getName(),11,DIM);path.setSingleLine(true);path.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        latestLogCard.addView(path);
+        LinearLayout actions=new LinearLayout(this);actions.setGravity(Gravity.END);
+        Button view=new Button(this);view.setText("OPEN LOG");view.setTextColor(ACCENT);
+        view.setOnClickListener(v->{RunHistory.markViewed(this,latest);RunLogViewer.show(this,latest);});
+        actions.addView(view);latestLogCard.addView(actions);
+    }
+
+    private void showRunHistory(){
+        List<File> logs=RunHistory.recent(this,20);
+        if(logs.isEmpty()){
+            new AlertDialog.Builder(this).setTitle("Run history")
+                    .setMessage("No run logs are saved yet. Every launch will create one here.")
+                    .setPositiveButton("DONE",null).show();return;
+        }
+        String[] labels=new String[logs.size()];
+        for(int i=0;i<logs.size();i++)labels[i]=RunHistory.title(logs.get(i))+"  ·  "+RunHistory.status(logs.get(i));
+        new AlertDialog.Builder(this).setTitle("Recent runs").setItems(labels,(dialog,index)->{
+            File selected=logs.get(index);RunHistory.markViewed(this,selected);RunLogViewer.show(this,selected);
+        }).setNegativeButton("CLOSE",null).show();
     }
     private void showSettings(){
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(false);
         LinearLayout content=new LinearLayout(this);content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(dp(4),dp(4),dp(4),dp(4));scroll.addView(content);
 
-        addSettingsHeading(content,"ARM64 SETTINGS","Active native runtime · arm64-v8a");
+        boolean arm32Edition=isArm32Edition();
+        addSettingsHeading(content,"ACTIVE RUNTIME",arm32Edition?"ARM32 edition · armeabi-v7a native process":"ARM64 edition · arm64-v8a native process");
         addSettingsToggle(content,"Compatibility fallbacks",
-            "Uses limited startup shims and safe defaults for missing imports, not a UIKit implementation. Unsupported view, event-loop, graphics, and Foundation APIs can still stop a game before its boot screen.",
+            "Uses limited startup shims and safe defaults for missing imports. This is not a full UIKit, Foundation, or Objective-C runtime, so some games can still stop before their boot screen.",
             AppSettings.useArm64CompatibilityFallbacks(this),
             (button,enabled)->AppSettings.setArm64CompatibilityFallbacks(this,enabled));
         addSettingsToggle(content,"Trace missing API calls",
-            "Records the first and every 4,096th call to an unresolved import. Off by default to reduce guest overhead; enable it when diagnosing a game.",
+            "Samples unresolved import calls (first hit and then every 4,096 calls). Off by default; enable it when investigating a launch failure.",
             AppSettings.traceArm64MissingApis(this),
             (button,enabled)->AppSettings.setArm64TraceMissingApis(this,enabled));
+        addSettingsToggle(content,"Real-time logging system (RTLS)",
+            "Writes sampled startup/API events, EGL and Surface diagnostics, and a 5-second render-loop heartbeat into each run log while it runs. Off by default. Basic run summaries and errors are always saved.",
+            AppSettings.useRealtimeLogging(this),
+            (button,enabled)->AppSettings.setRealtimeLogging(this,enabled));
 
-        addSettingsHeading(content,"ARM32 SETTINGS","Not available in this APK");
-        addSettingsInfo(content,"ARMv7 / AArch32 execution is not included",
-            "This build packages only the arm64-v8a runtime. ARM32-only bundles may be inspected, but cannot be launched. No ARM32 controls are shown because there is no ARM32 engine to configure.");
+        addSettingsHeading(content,"ARM32 / ARM64 GUEST SUPPORT","Choose the APK that matches the guest CPU");
+        if(arm32Edition){
+            addSettingsInfo(content,"ARMv7 execution edition is active",
+                "This variant runs in a 32-bit ARM process and can execute ARMv7/AArch32 guest instructions. ARM64-only games require the ARM64 edition. Framework and graphics compatibility remains partial.");
+        }else{
+            addSettingsInfo(content,"ARM32 edition available",
+                "ARM32 code cannot execute inside a 64-bit ARM process. Use the separately built ARM32 edition on devices that support 32-bit apps for ARMv7-only games. ARM64 games continue to use this edition.");
+        }
 
         new AlertDialog.Builder(this).setTitle("Runtime settings").setView(scroll)
             .setPositiveButton("DONE",null).show();
@@ -116,22 +229,38 @@ public class MainActivity extends Activity {
     }
     private void addSettingsInfo(LinearLayout parent,String title,String description){
         LinearLayout card=new LinearLayout(this);card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(12),dp(12),dp(12),dp(12));card.setBackgroundColor(SURFACE);
+        card.setPadding(dp(12),dp(12),dp(12),dp(12));card.setBackground(rounded(SURFACE,14,Color.rgb(36,46,65)));
         card.addView(label(title,15,TEXT));
         TextView detail=label(description,12,DIM);detail.setPadding(0,dp(4),0,0);card.addView(detail);
         parent.addView(card,new LinearLayout.LayoutParams(-1,-2));
     }
-    private void refresh(){
 
-        games.clear();games.addAll(library.entries());cards.removeAllViews();
-        if(games.isEmpty())cards.addView(label("No imported IPA bundles yet.",15,DIM));
+    private Bitmap decodeIcon(String path,int targetPixels){
+        if(path==null||path.isEmpty())return null;
+        try{
+            BitmapFactory.Options bounds=new BitmapFactory.Options();bounds.inJustDecodeBounds=true;
+            BitmapFactory.decodeFile(path,bounds);
+            if(bounds.outWidth<=0||bounds.outHeight<=0)return null;
+            int sample=1;
+            while(bounds.outWidth/(sample*2)>=targetPixels&&bounds.outHeight/(sample*2)>=targetPixels)sample*=2;
+            BitmapFactory.Options options=new BitmapFactory.Options();options.inSampleSize=sample;
+            return BitmapFactory.decodeFile(path,options);
+        }catch(OutOfMemoryError ignored){return null;}
+    }
+
+    private void refresh(){
+        games.clear();games.addAll(library.entries());cards.removeAllViews();updateLatestRunCard();
+        if(games.isEmpty()){
+            TextView empty=label("Your library is empty. Import an IPA to inspect its architecture and runtime blockers.",14,DIM);
+            empty.setPadding(dp(4),dp(8),dp(4),dp(14));cards.addView(empty);
+        }
         for(JSONObject g:games){
             LinearLayout card=new LinearLayout(this);card.setOrientation(LinearLayout.VERTICAL);card.setPadding(dp(14),dp(14),dp(14),dp(14));
-            card.setBackgroundColor(SURFACE);
+            card.setBackground(rounded(SURFACE,18,Color.rgb(36,46,65)));
             LinearLayout row=new LinearLayout(this);row.setOrientation(LinearLayout.HORIZONTAL);
-            ImageView icon=new ImageView(this);icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            Bitmap bitmap=BitmapFactory.decodeFile(g.optString("iconPath"));
-            if(bitmap!=null)icon.setImageBitmap(bitmap);else icon.setBackgroundColor(BG); // no fabricated app icon
+            ImageView icon=new ImageView(this);icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            Bitmap bitmap=decodeIcon(g.optString("iconPath"),dp(72));
+            if(bitmap!=null)icon.setImageBitmap(bitmap);else icon.setBackground(rounded(BG,12,0)); // no fabricated app icon
             row.addView(icon,new LinearLayout.LayoutParams(dp(72),dp(72)));
             LinearLayout text=new LinearLayout(this);text.setPadding(dp(12),0,0,0);text.setOrientation(LinearLayout.VERTICAL);
             TextView name=label(g.optString("name","Unnamed bundle"),18,TEXT);name.setSingleLine(true);name.setEllipsize(TextUtils.TruncateAt.END);
@@ -144,7 +273,7 @@ public class MainActivity extends Activity {
             Button launch=new Button(this);launch.setText("LAUNCH →");launch.setTextColor(ACCENT);
             launch.setOnClickListener(v->new AlertDialog.Builder(this).setTitle(g.optString("name"))
                 .setMessage(g.optString("summary")+"\n\nThis does not mean the game is launchable. Attempt execution anyway?")
-                .setPositiveButton("Attempt",(d,w)->launch(g.optString("executablePath"),g.optString("name")))
+                .setPositiveButton("Attempt",(d,w)->launch(g.optString("executablePath"),g.optString("name"),g.optString("engines","not detected")))
                 .setNegativeButton("Cancel",null).show());
             actions.addView(launch,new LinearLayout.LayoutParams(0,-2,1));
             Button remove=new Button(this);remove.setText("REMOVE");remove.setTextColor(DIM);
@@ -273,7 +402,8 @@ public class MainActivity extends Activity {
                 if(displayName.isEmpty()||displayName.equals("bundle"))displayName=stagedName;
                 JSONObject analysis=new JSONObject(Native.analyze(info.getString("executablePath")));
                 JSONArray arch=info.optJSONArray("architectures");
-                String architecture=arch==null||arch.length()==0?analysis.optString("arch","Unknown"):arch.optString(0);
+                String bundledArch=arch==null||arch.length()==0?"Unknown":arch.optString(0);
+                String architecture=analysis.optString("arch",bundledArch);
                 String engines=architecture+(analysis.optBoolean("opengles")?" · OpenGL ES":"")+
                         (analysis.optBoolean("metal")?" · Metal":"");
                 String state=analysis.optString("state",analysis.has("error")?"BLOCKED":"ANALYZED");
@@ -304,10 +434,13 @@ public class MainActivity extends Activity {
             }
         }finally{deleteTree(staging);}
     }
-    private void launch(String path,String title){
+    private void launch(String path,String title,String architecture){
         Intent intent=new Intent(this,GameActivity.class);
         if(path!=null)intent.putExtra(GameActivity.EXTRA_PATH,path);
+        String processAbi=isArm32Edition()?"ARMv7/AArch32 native process":"ARM64/AArch64 native process";
+        String analysisAbi=architecture==null||architecture.isEmpty()?"":" · bundle analysis: "+architecture;
         intent.putExtra(GameActivity.EXTRA_GAME,title)
+            .putExtra(GameActivity.EXTRA_ARCH,processAbi+analysisAbi)
             .putExtra(GameActivity.EXTRA_COMPAT,AppSettings.useArm64CompatibilityFallbacks(this))
             .putExtra(GameActivity.EXTRA_TRACE,AppSettings.traceArm64MissingApis(this));
         startActivity(intent);

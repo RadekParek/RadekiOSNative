@@ -28,12 +28,15 @@ void LinkedImage::write32(uint64_t a, uint32_t v) {
 }
 
 LinkedImage link(const Image& img, const LinkOptions& opt) {
-  if (img.arch != Arch::ARM64 && img.arch != Arch::ARM64e) throw LinkError(std::string("unsupported architecture for native relink: ") + archName(img.arch));
+  const bool arm32 = isArm32Architecture(img.arch);
+  const bool arm64 = img.arch == Arch::ARM64 || img.arch == Arch::ARM64e;
+  if (!arm32 && !arm64) throw LinkError(std::string("unsupported architecture for native relink: ") + archName(img.arch));
   if (img.cryptId) throw LinkError("image is encrypted (cryptid != 0); refusing to link encrypted segments");
   if (img.filetype != MH_EXECUTE && img.filetype != MH_DYLIB) throw LinkError("unsupported Mach-O filetype");
-  if (opt.loadBase % kPageSize) throw LinkError("loadBase must be 16K aligned");
+  const uint64_t pageSize = pageSizeForArch(img.arch);
+  if (opt.loadBase % pageSize) throw LinkError(arm32 ? "ARM32 loadBase must be 4K aligned" : "loadBase must be 16K aligned");
   for (const auto& f : img.fixups)
-    if (f.auth) throw LinkError("arm64e authenticated pointer fixups require the PAC layer (not implemented)");
+    if (f.auth) throw LinkError("authenticated pointer fixups require the PAC layer (not implemented)");
 
   uint64_t minVm = UINT64_MAX, maxVm = 0;
   for (const auto& s : img.segments) {
@@ -43,11 +46,14 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
   }
   if (minVm == UINT64_MAX) throw LinkError("no mappable segments");
   if (minVm != img.textBase()) throw LinkError("header segment is not the lowest mapped segment");
-  if (minVm % kPageSize) throw LinkError("image base not 16K aligned");
-  uint64_t imageSize = alignUp(maxVm - minVm, kPageSize);
+  if (minVm % pageSize) throw LinkError(arm32 ? "ARM32 image base not 4K aligned" : "image base not 16K aligned");
+  uint64_t imageSize = alignUp(maxVm - minVm, pageSize);
   if (imageSize > opt.maxImageBytes) throw LinkError("image too large");
+  if (arm32 && (opt.loadBase > UINT32_MAX || imageSize > UINT32_MAX - opt.loadBase))
+    throw LinkError("ARM32 image mapping exceeds the 32-bit address space");
 
   LinkedImage li;
+  li.arch = img.arch;
   li.loadBase = opt.loadBase;
   li.imageBase = minVm;
   li.slide = opt.loadBase - minVm;
@@ -80,13 +86,15 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
   }
 
   uint64_t stubBytes = alignUp(uint64_t(trapCount) * 4, 16) + uint64_t(opt.veneerSlots) * 16;
-  li.totalSize = imageSize + alignUp(std::max<uint64_t>(stubBytes, 16), kPageSize);
+  li.totalSize = imageSize + alignUp(std::max<uint64_t>(stubBytes, 16), pageSize);
+  if (arm32 && li.totalSize > UINT32_MAX - opt.loadBase)
+    throw LinkError("ARM32 image and stub mapping exceeds the 32-bit address space");
   li.memory.assign(li.totalSize, 0);
 
   for (const auto& s : img.segments) {
     if (s.name == "__PAGEZERO" || s.vmsize == 0) continue;
     if (s.filesize) std::memcpy(li.memory.data() + (s.vmaddr - minVm), img.data.data() + s.fileoff, s.filesize);
-    li.regions.push_back({s.name, s.vmaddr + li.slide, alignUp(s.vmsize, kPageSize), s.initprot, (s.initprot & VM_PROT_EXECUTE) != 0});
+    li.regions.push_back({s.name, s.vmaddr + li.slide, alignUp(s.vmsize, pageSize), s.initprot, (s.initprot & VM_PROT_EXECUTE) != 0});
     if (s.initprot & VM_PROT_EXECUTE) {
       bool anyCode = false;
       for (const auto& x : s.sections) {
@@ -96,7 +104,7 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
       }
       // A segment that marks no instruction sections at all: treat it as all code, which is
       // what an image without section attributes leaves us to assume.
-      if (!anyCode) li.codeRanges.push_back({s.vmaddr + li.slide, s.vmaddr + li.slide + alignUp(s.vmsize, kPageSize)});
+      if (!anyCode) li.codeRanges.push_back({s.vmaddr + li.slide, s.vmaddr + li.slide + alignUp(s.vmsize, pageSize)});
     }
   }
   uint64_t stubBase = li.loadBase + imageSize;
@@ -105,11 +113,18 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
   li.veneerBase = stubBase + alignUp(uint64_t(trapCount) * 4, 16);
   li.veneerCap = opt.veneerSlots;
 
+  if (trapCount > 0xFFFF) throw LinkError("too many unresolved imports");
   for (uint32_t t = 0; t < trapCount; ++t) {
     uint64_t addr = stubBase + uint64_t(t) * 4;
-    li.write32(addr, 0xD4200000u | (t & 0xFFFF) << 5);  // BRK #t
+    if (arm32) {
+      // A32 BKPT #imm16. It raises SIGTRAP in a 32-bit Android process and leaves the
+      // unresolved import name in LinkedImage::traps, matching the ARM64 BRK policy.
+      uint32_t immediate = t & 0xFFFF;
+      li.write32(addr, 0xE1200070u | ((immediate & 0xFFF0u) << 4) | (immediate & 0xFu));
+    } else {
+      li.write32(addr, 0xD4200000u | (t & 0xFFFF) << 5);  // BRK #t
+    }
   }
-  if (trapCount > 0xFFFF) throw LinkError("too many unresolved imports");
   for (size_t i = 0; i < img.imports.size(); ++i)
     if (res[i].trap >= 0) {
       uint32_t t = uint32_t(res[i].trap);
@@ -120,12 +135,13 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
     if (vm < minVm || vm - minVm + n > imageSize) throw LinkError("fixup location outside image");
     return vm - minVm;
   };
+  const uint64_t pointerSize = img.ptrSize();
   for (const auto& f : img.fixups) {
-    uint64_t o = slotOff(f.addr, 8);
+    uint64_t o = slotOff(f.addr, pointerSize);
     uint64_t v;
     if (f.kind == Fixup::Kind::Rebase) {
       if (f.target < minVm || f.target > maxVm) li.warnings.push_back("rebase target outside image at " + std::to_string(f.addr));
-      v = (f.target + li.slide) | (uint64_t(f.high8) << 56);
+      v = (f.target + li.slide) | (arm32 ? 0 : (uint64_t(f.high8) << 56));
       ++li.rebases;
     } else {
       const Import& im = img.imports.at(f.importIndex);
@@ -147,12 +163,19 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
       li.imports.push_back(std::move(b));
       ++li.binds;
     }
-    std::memcpy(li.memory.data() + o, &v, 8);
+    if (arm32) {
+      if (v > UINT32_MAX) throw LinkError("ARM32 fixup target exceeds the 32-bit address space");
+      uint32_t word = static_cast<uint32_t>(v);
+      std::memcpy(li.memory.data() + o, &word, sizeof word);
+    } else {
+      std::memcpy(li.memory.data() + o, &v, sizeof v);
+    }
   }
   for (const auto& s : img.segments)
     for (const auto& x : s.sections)
       if (x.type() == S_MOD_INIT_FUNC_POINTERS)
-        for (uint64_t k = 0; k + 8 <= x.size; k += 8) li.initPointerSlots.push_back(x.addr + k + li.slide);
+        for (uint64_t k = 0; k + pointerSize <= x.size; k += pointerSize)
+          li.initPointerSlots.push_back(x.addr + k + li.slide);
   for (const auto& sym : img.symbols)
     if (!sym.undefined() && !sym.stab() && sym.value >= minVm && sym.value < maxVm)
       li.definedSymbols.push_back({sym.value + li.slide, sym.name});
@@ -163,6 +186,7 @@ LinkedImage link(const Image& img, const LinkOptions& opt) {
 }
 
 void patchBranch(LinkedImage& li, uint64_t site, uint64_t target, bool link) {
+  if (isArm32Architecture(li.arch)) throw LinkError("ARM32 branch rewriting is not implemented");
   bool inCode = false;
   for (const auto& r : li.regions) if (r.code && site >= r.addr && site + 4 <= r.addr + r.size) inCode = true;
   if (!inCode || (site & 3)) throw LinkError("branch site is not in executable memory");
@@ -181,6 +205,10 @@ void patchBranch(LinkedImage& li, uint64_t site, uint64_t target, bool link) {
 
 Validation validate(const LinkedImage& li) {
   Validation out;
+  if (isArm32Architecture(li.arch)) {
+    out.warnings.push_back({li.loadBase, "ARMv7 PC-relative instruction validation is not implemented"});
+    return out;
+  }
   auto inData = [&](uint64_t a) {
     for (auto& d : li.dataInCode) if (a >= d.first && a < d.first + d.second) return true;
     return false;

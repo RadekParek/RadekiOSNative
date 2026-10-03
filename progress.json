@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "environment": "x86_64 host, g++12, make; no NDK/cmake/clang/aarch64 cross/qemu/network",
+  "environment": "x86_64 host, g++12, make; Android SDK/NDK, Gradle, Java, CMake, Ninja, ARM cross compiler and QEMU unavailable locally",
   "milestone1": {
     "name": "synthetic ARM64 Mach-O -> analyzer -> relinker -> runtime -> native exec -> correct output",
     "done": [
@@ -12,7 +12,7 @@
       "native runtime (mmap, W^X, signal-safe call into guest) + compat libSystem subset + JNI + guest-process service + on-device self-test button",
       "Objective-C metadata reading (class_ro_t, methods in both encodings, ivars, properties, categories, protocols) - read-only",
       "dyld-style image registry: multi-image load bases, dependency-first order, cross-image + re-export + flat binding, per-image unresolved reporting",
-      "runtime runs a whole linked image set in one reservation (multi-image entry point is ARM64-only, like the single-image path)",
+      "runtime runs a whole linked image set in one reservation, provided all images match the native ARM64 or ARMv7 process ABI",
       "code-range based validation (section instruction attributes) + hostile-metadata fuzzing"
     ],
     "verified_on_host": "relinked image executed by a test-only AArch64 interpreter; cross-image binding verified structurally (bound slots land inside the provider image, zero trap stubs when a provider exists)",
@@ -25,7 +25,7 @@
     ]
   },
   "tests": {
-    "checks": 486,
+    "checks": 518,
     "failures": 0,
     "run_with": [
       "make test",
@@ -72,13 +72,13 @@
     "encrypted binaries refused (not decrypted)",
     "weak-bind opcodes and exports trie not interpreted",
     "lazy binds bound eagerly",
-    "Android APK is built by CI, but the app's native path has never been executed on a device or emulator by me",
+    "ARM64 and ARM32 APKs passed NDK/Gradle builds and content verification in GitHub Actions run 37125335912; native guest execution on a device is still unverified",
     "ObjC metadata is read-only: no dispatch, no class registration, no method lookup",
     "loader has no dyld shared cache, no @rpath expansion, no initializer ordering across images, no weak coalescing",
     "libSystem subset is ~60 symbols; pthread support is a static non-recursive shim",
     "dispatch stubs and framework dummies keep calls alive and log them; they implement nothing (no rendering, no ObjC message dispatch), and C++ exceptions stay deliberately unsupported"
   ],
-  "next_blocker": "Retest the reported __next_prime fix with the rebuilt APK on ARM64 and capture the next failure; reaching a visible boot screen still requires a real UIKit/Objective-C application loop, Android surface presentation, Foundation and graphics support. No device execution is available here. Other host-side work includes exports-trie/weak-bind support and a fuller Foundation/NSObject runtime.",
+  "next_blocker": "Real-device execution remains unverified. A visible iOS game boot screen still needs a working Objective-C runtime, UIKit/Foundation, an app loop, Android surface presentation and complete graphics support. Other host-side gaps include exports-trie/weak-bind support and fuller pthread/TLS compatibility.",
   "milestone2": {
     "name": "multi-image loading + Objective-C metadata reading",
     "done": [
@@ -111,6 +111,27 @@
       "C++ exceptions/unwinding trap by symbol",
       "thread atexit is process-wide",
       "ZIP container extraction performed by Java ZipFile, not the C++ inflater"
+    ]
+  },
+  "milestone6": {
+    "name": "Persistent black-screen diagnostics, opt-in RTLS and ARM32 edition",
+    "done": [
+      "Every Android guest launch writes a private, bounded, persistent run log with game/ABI/settings metadata, guest output, native stage logs, graphics state and final crash/result JSON",
+      "Added recent-run history, latest-run card, copy/share log viewer, automatic first-return log prompt and a delayed black-screen panel with surface/EGL/event-loop/swaps diagnosis",
+      "RTLS preference defaults off; sampled compatibility calls and 5-second UIApplicationMain heartbeats are logged only when enabled; baseline output and errors remain recorded",
+      "Added ARM32 Mach-O selection, 4K relinking, 32-bit pointer rebases/binds, A32 BKPT stubs, A32 dispatch trampoline, pointer-width C++/pthread wrappers and a synthetic ARM32 self-test fixture",
+      "Separate arm64-v8a and armeabi-v7a Android product flavors; both NDK CLI builds, APK builds and packaged-ABI checks passed CI run 37125335912"
+    ],
+    "verified_on_host": "518 checks, 0 failures; clean under make SAN=1 test with ASan and UBSan after a clean rebuild. Tests cover durable native logging, RTLS off/on behavior, ARM32 Mach-O parsing/rebasing/traps, and 32-bit size_t mangling aliases.",
+    "verified_in_ci": {
+      "run": 37125335912,
+      "url": "https://github.com/RadekParek/RadekiOSNative/actions/runs/37125335912",
+      "jobs": "host regression/release build, Android ARM64 CLI NDK build, Android ARM32 CLI NDK build, both flavored APK builds and packaged JNI ABI checks"
+    },
+    "not_verified": [
+      "AArch32 trampoline execution, Apple ARMv7 libc++ ABI and 32-bit Android device/game runtime",
+      "Persistent Java UI paths and actual Surface/EGL rendering on a device",
+      "Real iOS game boot to a visible screen"
     ]
   }
 }

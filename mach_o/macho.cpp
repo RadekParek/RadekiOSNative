@@ -483,6 +483,32 @@ SliceChoice chooseSlice(const std::vector<SliceInfo>& slices) {
   return {std::nullopt, why};
 }
 
+SliceChoice chooseSliceForHost(const std::vector<SliceInfo>& slices) {
+#if defined(__arm__) && !defined(__aarch64__)
+  static const Arch order[] = {Arch::ARMv7, Arch::ARMv7s, Arch::ARMv7k, Arch::ARMv6};
+  constexpr const char* host = "AArch32 process";
+#elif defined(__aarch64__)
+  static const Arch order[] = {Arch::ARM64, Arch::ARM64e};
+  constexpr const char* host = "AArch64 process";
+#else
+  return chooseSlice(slices);
+#endif
+#if defined(__arm__) && !defined(__aarch64__) || defined(__aarch64__)
+  for (Arch want : order)
+    for (size_t i = 0; i < slices.size(); ++i)
+      if (slices[i].arch == want && !slices[i].bigEndian)
+        return {i, std::string("selected ") + archName(want) + " for the host process"};
+  std::string why = std::string("no native guest slice can run in this ") + host + "; found:";
+  for (const auto& s : slices) {
+    why += ' ';
+    why += archName(s.arch);
+    why += s.arch == Arch::Unknown ? "(cputype " + std::to_string(s.cputype) + ")" : "";
+    why += s.bigEndian ? "(big-endian)" : "";
+  }
+  return {std::nullopt, why};
+#endif
+}
+
 Image parseSlice(Bytes file, const SliceInfo& si) {
   Reader fr(file);
   Reader r = fr.sub(si.offset, si.size, "slice");

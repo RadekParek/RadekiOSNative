@@ -593,7 +593,7 @@ void* threadEntry(void* p) {
   return job->ret;
 }
 
-int c_pthread_create(uint64_t* threadOut, const void* attr, uint64_t start, void* arg) {
+int c_pthread_create(uintptr_t* threadOut, const void* attr, uintptr_t start, void* arg) {
   noteCompatCall("pthread_create");
   (void)attr;  // Apple's pthread_attr_t layout is not our host's; only the default is honoured
   auto* job = new ThreadJob{reinterpret_cast<void* (*)(void*)>(start), arg, nullptr};
@@ -604,24 +604,24 @@ int c_pthread_create(uint64_t* threadOut, const void* attr, uint64_t start, void
     return rc;
   }
   if (threadOut) {
-    // pthread_t is an opaque pointer on Apple and an unsigned long on Linux; both fit in 8 bytes.
-    uint64_t v = 0;
-    static_assert(sizeof(th) <= sizeof v, "pthread_t must fit in a 64-bit guest slot");
+    // pthread_t is pointer-sized in both guest and host ABIs.
+    uintptr_t v = 0;
+    static_assert(sizeof(th) <= sizeof v, "pthread_t must fit in a native guest slot");
     std::memcpy(&v, &th, sizeof th);
     *threadOut = v;
   }
   return 0;
 }
 
-int c_pthread_join(uint64_t thread, void** retval) {
+int c_pthread_join(uintptr_t thread, void** retval) {
   pthread_t th;
   std::memcpy(&th, &thread, sizeof th);
   int rc = pthread_join(th, retval);
   return rc;
 }
 
-uint64_t c_pthread_self() {
-  uint64_t v = 0;
+uintptr_t c_pthread_self() {
+  uintptr_t v = 0;
   pthread_t th = pthread_self();
   std::memcpy(&v, &th, sizeof th);
   return v;
@@ -630,25 +630,25 @@ uint64_t c_pthread_self() {
 // --- TLS key management: forward directly to host pthread_key_* ---------------------------
 // The guest sees pthread_key_t as an opaque 32-bit value that fits in 64 bits. Both Darwin
 // and Bionic/Linux treat it as an integer key index, so we can just cast.
-int c_pthread_key_create(uint64_t* keyOut, void (*destructor)(void*)) {
+int c_pthread_key_create(uintptr_t* keyOut, void (*destructor)(void*)) {
   noteCompatCall("pthread_key_create");
   if (!keyOut) return EINVAL;
   pthread_key_t k = 0;
   int rc = pthread_key_create(&k, destructor);
-  *keyOut = static_cast<uint64_t>(k);
+  *keyOut = static_cast<uintptr_t>(k);
   return rc;
 }
 
-int c_pthread_key_delete(uint64_t key) {
+int c_pthread_key_delete(uintptr_t key) {
   noteCompatCall("pthread_key_delete");
   return pthread_key_delete(static_cast<pthread_key_t>(key));
 }
 
-void* c_pthread_getspecific(uint64_t key) {
+void* c_pthread_getspecific(uintptr_t key) {
   return pthread_getspecific(static_cast<pthread_key_t>(key));
 }
 
-int c_pthread_setspecific(uint64_t key, const void* value) {
+int c_pthread_setspecific(uintptr_t key, const void* value) {
   return pthread_setspecific(static_cast<pthread_key_t>(key), value);
 }
 
@@ -672,7 +672,7 @@ MutexTable& mutexTable() {
   return t;
 }
 
-int c_pthread_mutex_init(uint64_t* mutex, const void* /*attr*/) {
+int c_pthread_mutex_init(uintptr_t* mutex, const void* /*attr*/) {
   noteCompatCall("pthread_mutex_init");
   if (!mutex) return EINVAL;
   MutexTable& t = mutexTable();
@@ -692,11 +692,11 @@ int c_pthread_mutex_init(uint64_t* mutex, const void* /*attr*/) {
   int rc = pthread_mutex_init(&entry->mtx, &ma);
   pthread_mutexattr_destroy(&ma);
   if (rc == 0) entry->initialized = true;
-  *mutex = id;
+  *mutex = static_cast<uintptr_t>(id);
   return rc;
 }
 
-int c_pthread_mutex_destroy(uint64_t* mutex) {
+int c_pthread_mutex_destroy(uintptr_t* mutex) {
   noteCompatCall("pthread_mutex_destroy");
   if (!mutex || *mutex == 0) return EINVAL;
   MutexTable& t = mutexTable();
@@ -711,7 +711,7 @@ int c_pthread_mutex_destroy(uint64_t* mutex) {
   return rc;
 }
 
-int c_pthread_mutex_lock(uint64_t* mutex) {
+int c_pthread_mutex_lock(uintptr_t* mutex) {
   if (!mutex) return EINVAL;
   MutexTable& t = mutexTable();
   // Lazy init for static PTHREAD_MUTEX_INITIALIZER-style locks (slot still 0 or not yet in table).
@@ -735,7 +735,7 @@ int c_pthread_mutex_lock(uint64_t* mutex) {
   return pthread_mutex_lock(&it->second->mtx);
 }
 
-int c_pthread_mutex_unlock(uint64_t* mutex) {
+int c_pthread_mutex_unlock(uintptr_t* mutex) {
   if (!mutex) return EINVAL;
   MutexTable& t = mutexTable();
   std::lock_guard<std::mutex> l(t.table);
@@ -744,7 +744,7 @@ int c_pthread_mutex_unlock(uint64_t* mutex) {
   return pthread_mutex_unlock(&it->second->mtx);
 }
 
-int c_pthread_mutex_trylock(uint64_t* mutex) {
+int c_pthread_mutex_trylock(uintptr_t* mutex) {
   if (!mutex) return EINVAL;
   MutexTable& t = mutexTable();
   std::lock_guard<std::mutex> l(t.table);
@@ -779,7 +779,7 @@ void c_cxx_mutex_d1(void* guestMutexPtr) {
   // containing a pointer to (or an inline representation of) the underlying pthread_mutex_t.
   // In Apple's libc++ on ARM64, std::__1::mutex contains a pthread_mutex_t sized object that
   // stores a 64-bit signature/pointer. We treat the first 8 bytes as our mutex-table ID.
-  uint64_t id = *reinterpret_cast<uint64_t*>(guestMutexPtr);
+  uintptr_t id = *reinterpret_cast<uintptr_t*>(guestMutexPtr);
   if (id == 0) return;
   MutexTable& t = mutexTable();
   std::lock_guard<std::mutex> l(t.table);
@@ -828,8 +828,12 @@ bool c_cxx_shared_weak_count_release_shared(void* self) {
   auto* cnt = static_cast<SharedWeakCountLayout*>(self);
   uintptr_t selfAddr = reinterpret_cast<uintptr_t>(self);
   uintptr_t vtAddr = reinterpret_cast<uintptr_t>(cnt->vtable);
-  constexpr uintptr_t kLo = 0x100000ull;
+  constexpr uintptr_t kLo = 0x100000u;
+#if UINTPTR_MAX > UINT32_MAX
   constexpr uintptr_t kHi = 0x00007FFFFFFFFFFFull;
+#else
+  constexpr uintptr_t kHi = UINTPTR_MAX;
+#endif
   if (hostFn && selfAddr > kLo && selfAddr < kHi && vtAddr > kLo && vtAddr < kHi) {
     return hostFn(self);
   }
@@ -860,8 +864,13 @@ template <class F> uint64_t addr(F* f) { return reinterpret_cast<uint64_t>(f); }
 // _exit/_abort end the current run: abortGuest() unwinds back into runtime::run(), which
 // reports the exit code, so the guest stops at the same point it would on iOS.
 void appendGuestOutput(const std::string& s) {
-  std::lock_guard<std::mutex> l(g_outMutex);
-  g_out += s;
+  {
+    std::lock_guard<std::mutex> l(g_outMutex);
+    g_out += s;
+  }
+  // Persist this output immediately to the per-run file when the Android launcher has one open.
+  // Keeping the file writer outside g_outMutex prevents slow storage from blocking readers.
+  writeRunLog(s);
 #ifdef __ANDROID__
   __android_log_write(ANDROID_LOG_INFO, "RadekiGuest", s.c_str());
 #endif
