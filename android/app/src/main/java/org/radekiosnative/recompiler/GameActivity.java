@@ -84,7 +84,7 @@ public class GameActivity extends Activity {
             }
             // Forward the primary pointer; MCPE 0.10.4 uses single-touch primarily.
             int idx = ev.getActionIndex();
-            Native.touchEvent(mapped, ev.getX(idx), ev.getY(idx()), ev.getEventTime());
+            Native.touchEvent(mapped, ev.getX(idx), ev.getY(idx), ev.getEventTime());
             return true;
         });
     }
