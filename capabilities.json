@@ -58,6 +58,10 @@
     "crash_diagnostics": "partial",
     "durable_run_logging": "partial",
     "realtime_logging_opt_in": "tested_host",
-    "arm32_java_ui": "unverified_android"
+    "arm32_java_ui": "unverified_android",
+    "egl_thread_safe_surface_bridge": "tested_host",
+    "cadisplaylink_frame_heartbeat": "tested_host",
+    "frame_present_after_render_step": "tested_host",
+    "sandbox_tree_verification": "tested_host"
   }
 }

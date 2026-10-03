@@ -7,6 +7,7 @@
 #endif
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -50,6 +51,32 @@ std::atomic<uint64_t> g_frameCounter{0};
 std::atomic<int> g_lastGraphicsError{0};
 std::atomic<const char*> g_lastGraphicsStage{nullptr};
 bool g_eglWindowSurface = false;
+
+// --- EGL thread ownership (EGL_BAD_ACCESS 0x3002 prevention) --------------------------------
+// eglMakeCurrent/eglSwapBuffers are only legal on the thread that owns the binding. Android
+// Surface callbacks arrive on the UI thread while the guest render thread holds the context
+// current; touching the binding from the UI thread there raises EGL_BAD_ACCESS (0x3002).
+// We therefore record the designated render thread and queue surface rebinds for it: the
+// UIApplicationMain frame loop drains the queue, so every eglMakeCurrent we issue happens on
+// the render thread (or inline from a thread when nothing else owns the binding).
+int64_t g_eglOwnerTid = 0;                    // guarded by g_bridgeMutex; 0 = no owner
+std::atomic<bool> g_eglRebindPending{false};  // a rebind is queued for the render thread
+std::atomic<uint64_t> g_engineForcedSwaps{0}; // frames the loop presented after the render step
+std::atomic<uint32_t> g_heartbeatFps{60};     // current engine frame heartbeat target
+
+int64_t hostThreadId() {
+#ifdef SYS_gettid
+  return static_cast<int64_t>(::syscall(SYS_gettid));
+#else
+  return static_cast<int64_t>(::getpid());
+#endif
+}
+
+// Must hold g_bridgeMutex. True when the EGL binding is owned by another thread: every
+// unbind/rebind must then be deferred to that owner, never executed here.
+bool eglBindingOwnedByOtherThreadLocked() {
+  return g_eglOwnerTid != 0 && g_eglOwnerTid != hostThreadId();
+}
 
 // --- Touch event queue: Android MotionEvent -> iOS UITouch forwarding ----------------------
 // iOS UITouch carries phase (0=began, 1=moved, 2=ended/cancelled), a view-relative location in
@@ -265,6 +292,50 @@ void ensureEglContextInitialized(DummyEAGLContext* ctx) {
   g_eglConfig = cfg;
 }
 
+// Result of one present attempt through presentEglFrameLocked().
+enum class EglPresentResult {
+  kSwapped,       // eglSwapBuffers succeeded; presentedFrames was incremented
+  kNoEgl,         // no EGL entry points / display / surface available
+  kRebindFailed,  // the context could not be made current on this thread first
+  kSwapFailed,    // eglSwapBuffers itself failed
+};
+
+// Presents the context's current EGL surface. Must hold g_bridgeMutex and be called on the
+// render thread. Before eglSwapBuffers, eglGetCurrentContext() is compared against the context
+// we intend to present with; on mismatch (foreign or no context current on this thread) we
+// explicitly unbind with eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)
+// and rebind ours -- rebinding without that step raises EGL_BAD_ACCESS (0x3002).
+EglPresentResult presentEglFrameLocked(DummyEAGLContext* ctx) {
+  if (!ctx) return EglPresentResult::kNoEgl;
+  NativeGles& ng = nativeGles();
+  if (!ng.eglSwapBuffers || !ng.eglMakeCurrent || !ctx->eglDisplay || !ctx->eglSurface)
+    return EglPresentResult::kNoEgl;
+  void* dpy = reinterpret_cast<void*>(ctx->eglDisplay);
+  void* surf = reinterpret_cast<void*>(ctx->eglSurface);
+  void* want = reinterpret_cast<void*>(ctx->eglContext);
+  if (ng.eglGetCurrentContext) {
+    void* current = ng.eglGetCurrentContext();
+    if (current != want) {
+      // Explicit EGL_NO_SURFACE / EGL_NO_CONTEXT unbind before rebinding (0x3002 avoidance).
+      if (current && !ng.eglMakeCurrent(dpy, nullptr, nullptr, nullptr))
+        reportEglFailure("eglMakeCurrent(EGL_NO_SURFACE, EGL_NO_CONTEXT) unbind");
+      if (!ng.eglMakeCurrent(dpy, surf, surf, want)) {
+        reportEglFailure("eglMakeCurrent (present rebind)");
+        ctx->isCurrent = 0;
+        return EglPresentResult::kRebindFailed;
+      }
+      ctx->isCurrent = 1;
+      g_eglOwnerTid = hostThreadId();
+    }
+  }
+  if (!ng.eglSwapBuffers(dpy, surf)) return EglPresentResult::kSwapFailed;
+  ++ctx->presentedFrames;
+  static std::atomic<bool> firstSwapLogged{false};
+  if (!firstSwapLogged.exchange(true, std::memory_order_relaxed))
+    logRunEvent("first frame presented to the Android Surface via eglSwapBuffers (successfulSwaps=1)");
+  return EglPresentResult::kSwapped;
+}
+
 // Interned string storage for dynamic ObjC string operations (stringByAppendingPathComponent:, etc.)
 std::mutex g_strPoolMutex;
 std::deque<std::string> g_strPool;
@@ -312,9 +383,22 @@ int eaglSetCurrentContext(void* ctxPtr) {
     if (g_currentEAGLContext) g_currentEAGLContext->isCurrent = 0;
     g_currentEAGLContext = nullptr;
     NativeGles& ng = nativeGles();
+    bool bindingReleased = false;
     if (ng.eglMakeCurrent && g_dummyEAGLContext.eglDisplay) {
-      ng.eglMakeCurrent(reinterpret_cast<void*>(g_dummyEAGLContext.eglDisplay), nullptr, nullptr, nullptr);
+      void* dpy = reinterpret_cast<void*>(g_dummyEAGLContext.eglDisplay);
+      // Only this thread may release the binding when it actually holds it; unbinding from a
+      // different thread while the render thread owns the context raises EGL_BAD_ACCESS (0x3002).
+      void* current = ng.eglGetCurrentContext ? ng.eglGetCurrentContext() : nullptr;
+      if (current == reinterpret_cast<void*>(g_dummyEAGLContext.eglContext)) {
+        ng.eglMakeCurrent(dpy, nullptr, nullptr, nullptr);
+        bindingReleased = true;
+      } else if (!current && !eglBindingOwnedByOtherThreadLocked()) {
+        bindingReleased = true;  // nothing bound anywhere; stale bookkeeping only
+      }
+    } else if (!eglBindingOwnedByOtherThreadLocked()) {
+      bindingReleased = true;  // no EGL present: bookkeeping only, never steal the render thread
     }
+    if (bindingReleased) g_eglOwnerTid = 0;
     return 1;
   }
   DummyEAGLContext* ctx = (ctxPtr == &g_dummyEAGLContext) ? static_cast<DummyEAGLContext*>(ctxPtr) : &g_dummyEAGLContext;
@@ -324,14 +408,24 @@ int eaglSetCurrentContext(void* ctxPtr) {
   NativeGles& ng = nativeGles();
   bool madeCurrent = false;
   if (ng.eglMakeCurrent && ctx->eglDisplay && ctx->eglContext && ctx->eglSurface) {
+    void* dpy = reinterpret_cast<void*>(ctx->eglDisplay);
     void* surf = reinterpret_cast<void*>(ctx->eglSurface);
-    madeCurrent = ng.eglMakeCurrent(reinterpret_cast<void*>(ctx->eglDisplay), surf, surf,
-                                    reinterpret_cast<void*>(ctx->eglContext)) != 0;
+    void* want = reinterpret_cast<void*>(ctx->eglContext);
+    // If a different context is current on this thread, explicitly unbind it first
+    // (eglMakeCurrent would otherwise fail with EGL_BAD_ACCESS 0x3002).
+    if (ng.eglGetCurrentContext) {
+      void* current = ng.eglGetCurrentContext();
+      if (current && current != want) ng.eglMakeCurrent(dpy, nullptr, nullptr, nullptr);
+    }
+    madeCurrent = ng.eglMakeCurrent(dpy, surf, surf, want) != 0;
     if (!madeCurrent) reportEglFailure("eglMakeCurrent");
   } else {
     reportGraphicsIssue("EGL context/surface unavailable when setting current", 0);
   }
   ctx->isCurrent = madeCurrent ? 1u : 0u;
+  // The caller designates itself as the render thread; queued surface rebinds drain here and
+  // the next present attempt retries the binding (self-healing when EGL was not ready yet).
+  g_eglOwnerTid = hostThreadId();
   g_currentEAGLContext = ctx;
   // Preserve the old compatibility behavior (UIKit reports success) while the run log and
   // live diagnostics expose whether a real Android EGL context was actually made current.
@@ -347,18 +441,22 @@ int eaglPresentRenderbuffer(void* self, uint32_t /*target*/) {
   noteCompatCall("EAGLContext::presentRenderbuffer");
   std::lock_guard<std::mutex> lock(g_bridgeMutex);
   DummyEAGLContext* ctx = (self == &g_dummyEAGLContext) ? static_cast<DummyEAGLContext*>(self) : &g_dummyEAGLContext;
-  NativeGles& ng = nativeGles();
-  if (!ng.eglSwapBuffers || !ctx->eglDisplay || !ctx->eglSurface) {
-    static std::atomic<uint64_t> missingSurfaceWarnings{0};
-    uint64_t count = missingSurfaceWarnings.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (count == 1 || count % 300 == 0)
-      reportGraphicsIssue("presentRenderbuffer has no EGL surface", 0);
-  } else if (!ng.eglSwapBuffers(reinterpret_cast<void*>(ctx->eglDisplay), reinterpret_cast<void*>(ctx->eglSurface))) {
-    static std::atomic<uint64_t> swapFailures{0};
-    uint64_t count = swapFailures.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (count == 1 || count % 300 == 0) reportEglFailure("eglSwapBuffers");
-  } else {
-    ++ctx->presentedFrames;
+  switch (presentEglFrameLocked(ctx)) {
+    case EglPresentResult::kNoEgl: {
+      static std::atomic<uint64_t> missingSurfaceWarnings{0};
+      uint64_t count = missingSurfaceWarnings.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (count == 1 || count % 300 == 0)
+        reportGraphicsIssue("presentRenderbuffer has no EGL surface", 0);
+      break;
+    }
+    case EglPresentResult::kSwapFailed: {
+      static std::atomic<uint64_t> swapFailures{0};
+      uint64_t count = swapFailures.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (count == 1 || count % 300 == 0) reportEglFailure("eglSwapBuffers");
+      break;
+    }
+    default:
+      break;  // swapped (or a rebind failure already reported by the helper)
   }
   return 1;
 }
@@ -378,16 +476,27 @@ int eaglRenderbufferStorageFromDrawable(void* /*self*/, uint32_t target, void* /
 }
 
 // (Re)creates the EGL window surface for the currently bound dummy EAGLContext. Must be called
-// under g_bridgeMutex. Destroys any previous window surface first.
+// under g_bridgeMutex AND on the thread that owns the EGL binding (the render thread); callers
+// on any other thread must defer via g_eglRebindPending instead (see bindAndroidEglWindow /
+// updateAndroidEglWindow), because eglMakeCurrent from a foreign thread raises EGL_BAD_ACCESS
+// (0x3002) while the render thread holds the context current.
 void recreateEglSurfaceLocked() {
   NativeGles& ng = nativeGles();
   if (!g_dummyEAGLContext.eglDisplay || !g_dummyEAGLContext.eglContext || !g_eglConfig) return;
   void* dpy = reinterpret_cast<void*>(g_dummyEAGLContext.eglDisplay);
-  // Destroy the previous surface if any (but never a pbuffer we created as a placeholder,
-  // identified by g_androidNativeWindow being null at the time of creation -- we simply drop
-  // it if we are transitioning to a real window).
-  if (g_dummyEAGLContext.eglSurface && ng.eglMakeCurrent) {
-    ng.eglMakeCurrent(dpy, nullptr, nullptr, nullptr);
+  void* want = reinterpret_cast<void*>(g_dummyEAGLContext.eglContext);
+  // A current EGLSurface cannot be destroyed: first compare eglGetCurrentContext() with the
+  // context we manage and explicitly unbind (EGL_NO_SURFACE / EGL_NO_CONTEXT) before the swap.
+  if (g_dummyEAGLContext.eglSurface && ng.eglMakeCurrent && ng.eglGetCurrentContext) {
+    void* current = ng.eglGetCurrentContext();
+    if (current == want) {
+      ng.eglMakeCurrent(dpy, nullptr, nullptr, nullptr);
+      g_eglOwnerTid = hostThreadId();  // this thread still owns the (now unbound) context
+    } else if (current) {
+      // A foreign context is current on this thread; unbind it explicitly so the following
+      // eglMakeCurrent for our context cannot fail with EGL_BAD_ACCESS (0x3002).
+      ng.eglMakeCurrent(dpy, nullptr, nullptr, nullptr);
+    }
   }
   if (g_dummyEAGLContext.eglSurface) {
     using EglDestroySurfaceFn = int (*)(void*, void*);
@@ -411,9 +520,14 @@ void recreateEglSurfaceLocked() {
     else if (g_androidNativeWindow) logRunEvent("EGL surface rebind fell back to a pbuffer; game frames will not reach the screen");
   }
   g_dummyEAGLContext.eglSurface = reinterpret_cast<uint64_t>(surf);
-  if (g_dummyEAGLContext.isCurrent && surf && ng.eglMakeCurrent &&
-      !ng.eglMakeCurrent(dpy, surf, surf, reinterpret_cast<void*>(g_dummyEAGLContext.eglContext))) {
-    reportEglFailure("eglMakeCurrent (surface rebind)");
+  if (g_dummyEAGLContext.isCurrent && surf && ng.eglMakeCurrent) {
+    if (ng.eglMakeCurrent(dpy, surf, surf, want)) {
+      g_eglOwnerTid = hostThreadId();
+    } else {
+      reportEglFailure("eglMakeCurrent (surface rebind)");
+      g_dummyEAGLContext.isCurrent = 0;
+      g_eglOwnerTid = 0;
+    }
   }
 }
 
@@ -428,7 +542,14 @@ void bindAndroidEglWindow(void* nativeWindow, int width, int height) {
   g_dummyUIWindow.height = static_cast<uint32_t>(g_surfaceHeight);
   // Ensure EGL context exists and attach a window surface to it.
   ensureEglContextInitialized(&g_dummyEAGLContext);
-  if (g_dummyEAGLContext.eglDisplay) recreateEglSurfaceLocked();
+  if (eglBindingOwnedByOtherThreadLocked()) {
+    // The render thread holds the EGL binding: queue the rebind for it instead of touching
+    // eglMakeCurrent here (that would raise EGL_BAD_ACCESS 0x3002 on the UI thread).
+    g_eglRebindPending.store(true, std::memory_order_release);
+    logRunEvent("EGL surface rebind deferred to the render thread after Surface creation (EGL context current elsewhere; avoiding EGL_BAD_ACCESS 0x3002)");
+  } else if (g_dummyEAGLContext.eglDisplay) {
+    recreateEglSurfaceLocked();
+  }
 #ifdef __ANDROID__
   // ANativeWindow_fromSurface returns an acquired reference. The bridge owns the current one;
   // release the redundant incoming reference for the same window, or the replaced window after
@@ -449,8 +570,19 @@ void updateAndroidEglWindow(void* nativeWindow, int width, int height) {
   if (height > 0) g_surfaceHeight = height;
   g_dummyUIWindow.width = static_cast<uint32_t>(g_surfaceWidth);
   g_dummyUIWindow.height = static_cast<uint32_t>(g_surfaceHeight);
-  if (g_dummyEAGLContext.eglDisplay) recreateEglSurfaceLocked();
+  if (eglBindingOwnedByOtherThreadLocked()) {
+    // Android Surface changed on a non-render thread while the render thread holds the EGL
+    // context current. Rebuilding the surface here would call eglMakeCurrent on this thread
+    // and fail with EGL_BAD_ACCESS (0x3002); queue the rebind for the render thread instead.
+    g_eglRebindPending.store(true, std::memory_order_release);
+    logRunEvent("EGL surface rebind deferred to the render thread after Android Surface changed (EGL context current elsewhere; avoiding EGL_BAD_ACCESS 0x3002)");
+  } else if (g_dummyEAGLContext.eglDisplay) {
+    recreateEglSurfaceLocked();
+  }
 #ifdef __ANDROID__
+  // The new window (or null) is already recorded above; the outgoing window's own reference is
+  // released here. The old EGLSurface still holds its own ANativeWindow reference, so it stays
+  // alive until the deferred rebind destroys it on the render thread.
   if (sameWindow && nativeWindow) ANativeWindow_release(static_cast<ANativeWindow*>(nativeWindow));
   else if (previous) ANativeWindow_release(static_cast<ANativeWindow*>(previous));
 #endif
@@ -473,10 +605,13 @@ GraphicsStatus currentGraphicsStatus() {
   status.windowSurface = g_eglWindowSurface;
   status.contextCurrent = g_dummyEAGLContext.isCurrent != 0;
   status.displayLinkRegistered = g_dummyCADisplayLink.registeredInRunLoop != 0;
+  status.surfaceRebindPending = g_eglRebindPending.load(std::memory_order_acquire);
   status.width = g_surfaceWidth;
   status.height = g_surfaceHeight;
+  status.heartbeatFps = g_heartbeatFps.load(std::memory_order_relaxed);
   status.uiFrames = g_frameCounter.load(std::memory_order_relaxed);
   status.presentedFrames = g_dummyEAGLContext.presentedFrames;
+  status.engineForcedSwaps = g_engineForcedSwaps.load(std::memory_order_relaxed);
   const char* stage = g_lastGraphicsStage.load(std::memory_order_relaxed);
   const int error = g_lastGraphicsError.load(std::memory_order_relaxed);
   if (stage) status.lastEglIssue = std::string(stage) + " (0x" + [] (int value) {
@@ -533,6 +668,10 @@ DummyCADisplayLink* caDisplayLinkWithTargetSelector(uint64_t target, uint64_t se
   g_dummyCADisplayLink.selector = selector;
   g_dummyCADisplayLink.frameInterval = 1;
   g_dummyCADisplayLink.duration = 1.0 / 60.0;
+  char msg[128];
+  std::snprintf(msg, sizeof msg, "CADisplayLink registered: target=0x%llx selector=0x%llx (60 FPS heartbeat)",
+                static_cast<unsigned long long>(target), static_cast<unsigned long long>(selector));
+  logRunEvent(msg);
   return &g_dummyCADisplayLink;
 }
 
@@ -543,6 +682,10 @@ int caDisplayLinkAddToRunLoop(void* link, uint64_t runLoop, uint64_t mode) {
   dl->runLoop = runLoop;
   dl->mode = mode;
   dl->registeredInRunLoop = 1;
+  // The UIApplicationMain frame loop picks the registration up on its next cycle (the target
+  // and selector are re-read every frame), so a display link created after launch still drives
+  // the guest render step immediately.
+  logRunEvent("CADisplayLink added to the run loop; the engine frame heartbeat will invoke its target selector every frame cycle");
   return 1;
 }
 
@@ -796,11 +939,13 @@ int uiApplicationMainShim(int argc, char** argv, const void* principal, const vo
   appendGuestOutput("[radeki] UIApplicationMain: entering native event loop (EGL/GLESv2 display bound)\n");
 
   // Make sure the EGL context + surface exist before entering the loop so the guest's
-  // renderbufferStorage/presentRenderbuffer calls can operate on a real drawable.
+  // renderbufferStorage/presentRenderbuffer calls can operate on a real drawable. This shim
+  // runs on the guest's main thread, which from here on is also the EGL render thread.
   {
     std::lock_guard<std::mutex> lock(g_bridgeMutex);
     if (g_dummyEAGLContext.api == 0) g_dummyEAGLContext.api = 2;
     ensureEglContextInitialized(&g_dummyEAGLContext);
+    g_eglRebindPending.store(false, std::memory_order_relaxed);  // stale flag from an earlier run
     if (g_androidNativeWindow && g_dummyEAGLContext.eglDisplay) {
       recreateEglSurfaceLocked();
     }
@@ -810,6 +955,7 @@ int uiApplicationMainShim(int argc, char** argv, const void* principal, const vo
   g_uiLoopShouldExit.store(false, std::memory_order_release);
   g_uiLoopExitCode.store(0, std::memory_order_relaxed);
   g_frameCounter.store(0, std::memory_order_relaxed);
+  g_engineForcedSwaps.store(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(g_bridgeMutex);
     g_dummyEAGLContext.presentedFrames = 0;
@@ -825,70 +971,152 @@ int uiApplicationMainShim(int argc, char** argv, const void* principal, const vo
         std::to_string(status.width) + "x" + std::to_string(status.height));
   }
 
-  // Target ~60fps loop. Each iteration:
-  //   1. Drain any pending Android MotionEvents.
-  //   2. Fire the CADisplayLink target selector (the game's -tick: method).
-  //   3. Let the guest call presentRenderbuffer which eglSwapBuffers through our shim.
-  //   4. Respect requestExitUiLoop() so the JNI host can terminate on surface destroy.
+  // CADisplayLink / engine frame heartbeat. Target is 60 FPS; when the host cannot hold that
+  // pace (a full second of consecutive missed deadlines) the heartbeat permanently falls back
+  // to 30 FPS for this run. Each frame cycle:
+  //   1. Apply any EGL surface rebind queued by an Android Surface change. This always happens
+  //      on the render thread, so eglMakeCurrent never executes on a foreign thread and the
+  //      rebind cannot fail with EGL_BAD_ACCESS (0x3002).
+  //   2. Drain any pending Android MotionEvents.
+  //   3. Fire the registered CADisplayLink target selector (the guest's main render step).
+  //   4. Present the frame: eglSwapBuffers immediately after the render step completes, also
+  //      when the guest did not call presentRenderbuffer itself.
+  //   5. Respect requestExitUiLoop() so the JNI host can terminate on surface destroy.
   using Clock = std::chrono::steady_clock;
-  const auto frameDuration = std::chrono::nanoseconds(16666667);  // ~60 Hz
+  constexpr int kBaseFps = 60;
+  constexpr int kMissedDeadlinesBeforeFallback = 60;  // ~1 s behind before dropping to 30 FPS
+  int fallbackMultiplier = 1;  // 1 = 60 FPS, 2 = 30 FPS fallback (one-way per run)
+  int missedDeadlines = 0;
   auto nextFrame = Clock::now();
   uint64_t frames = 0;
+  bool loggedFirstTick = false;
   while (!g_uiLoopShouldExit.load(std::memory_order_acquire)) {
-    drainTouchEventsForFrame();
-
-    // Update CADisplayLink timestamp/duration so the guest sees a monotonically increasing clock.
-    {
+    // 1. Deferred EGL surface rebind (Android Surface changed on another thread).
+    if (g_eglRebindPending.load(std::memory_order_acquire)) {
       std::lock_guard<std::mutex> lock(g_bridgeMutex);
-      int interval = g_dummyCADisplayLink.frameInterval > 0 ? g_dummyCADisplayLink.frameInterval : 1;
-      g_dummyCADisplayLink.duration = (1.0 / 60.0) * static_cast<double>(interval);
-      g_dummyCADisplayLink.timestamp = hostMediaTimeSeconds();
+      g_eglRebindPending.store(false, std::memory_order_relaxed);
+      if (g_dummyEAGLContext.eglDisplay) recreateEglSurfaceLocked();
+      logRunEvent(std::string("queued EGL surface rebind applied on the render thread") +
+                  (g_dummyEAGLContext.eglDisplay ? "" : " (no EGL display on this host)"));
     }
 
-    DummyCADisplayLink dl;
-    uint64_t target = 0, sel = 0;
+    drainTouchEventsForFrame();
+
+    // 2. Update the CADisplayLink clock so the guest sees a monotonically increasing timestamp,
+    //    and derive this frame's cadence from the guest's frameInterval (setFrameInterval:)
+    //    multiplied by the 30 FPS fallback factor.
+    int guestInterval = 1;
+    {
+      std::lock_guard<std::mutex> lock(g_bridgeMutex);
+      guestInterval = g_dummyCADisplayLink.frameInterval > 0 ? g_dummyCADisplayLink.frameInterval : 1;
+      g_dummyCADisplayLink.duration = (1.0 / 60.0) * static_cast<double>(guestInterval * fallbackMultiplier);
+      g_dummyCADisplayLink.timestamp = hostMediaTimeSeconds();
+    }
+    g_heartbeatFps.store(static_cast<uint32_t>(kBaseFps / (guestInterval * fallbackMultiplier)),
+                         std::memory_order_relaxed);
+
+    uint64_t target = 0, sel = 0, swapsBefore = 0;
     int paused = 0, registered = 0;
     {
       std::lock_guard<std::mutex> lock(g_bridgeMutex);
-      dl = g_dummyCADisplayLink;
-      target = dl.target;
-      sel = dl.selector;
-      paused = dl.paused;
-      registered = dl.registeredInRunLoop;
+      target = g_dummyCADisplayLink.target;
+      sel = g_dummyCADisplayLink.selector;
+      paused = g_dummyCADisplayLink.paused;
+      registered = g_dummyCADisplayLink.registeredInRunLoop;
+      swapsBefore = g_dummyEAGLContext.presentedFrames;
     }
 
-    if (registered && !paused && target && sel) {
+    // 3. Engine frame heartbeat: invoke the registered CADisplayLink target selector every
+    // frame cycle so the guest's main render step executes.
+    const bool fired = registered && !paused && target && sel;
+    if (fired) {
       objcMsgSendShim(target, sel, reinterpret_cast<uint64_t>(&g_dummyCADisplayLink), 0, 0, 0);
+      if (!loggedFirstTick) {
+        loggedFirstTick = true;
+        char msg[128];
+        std::snprintf(msg, sizeof msg,
+                      "CADisplayLink frame callback first invoked (target=0x%llx, selector=0x%llx)",
+                      static_cast<unsigned long long>(target), static_cast<unsigned long long>(sel));
+        logRunEvent(msg);
+      }
     }
 
-    // If no display link callback has been registered yet, still swap buffers if the guest
-    // rendered something on its own. Otherwise presentRenderbuffer already calls eglSwapBuffers.
     ++frames;
     g_frameCounter.store(frames, std::memory_order_relaxed);
+
+    // 4. Frame swap: present immediately after the guest frame render step completes. When the
+    // callback already presented via presentRenderbuffer, presentedFrames moved and we do not
+    // swap twice; otherwise we swap here so the frame still reaches the Android screen and
+    // successfulSwaps advances in the run log / RTLS heartbeat.
+    if (fired) {
+      std::lock_guard<std::mutex> lock(g_bridgeMutex);
+      if (g_dummyEAGLContext.presentedFrames == swapsBefore) {
+        if (presentEglFrameLocked(&g_dummyEAGLContext) == EglPresentResult::kSwapped) {
+          g_engineForcedSwaps.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          static std::atomic<uint64_t> forcedSwapFailures{0};
+          uint64_t count = forcedSwapFailures.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (count == 1 || count % 300 == 0)
+            logRunEvent("post-render-step eglSwapBuffers has no usable EGL surface yet (occurrence " +
+                        std::to_string(count) + ")");
+        }
+      }
+    }
+
     if (realtimeLoggingEnabled() && frames % 300 == 0) {
       GraphicsStatus status = currentGraphicsStatus();
       std::string heartbeat = "UIApplicationMain heartbeat: loopFrames=" + std::to_string(frames) +
           ", successfulSwaps=" + std::to_string(status.presentedFrames) +
+          ", engineForcedSwaps=" + std::to_string(status.engineForcedSwaps) +
+          ", heartbeatFps=" + std::to_string(status.heartbeatFps) +
           ", displayLink=" + (status.displayLinkRegistered ? "registered" : "missing") +
           ", EGLwindow=" + (status.windowSurface ? "yes" : "no") +
-          ", contextCurrent=" + (status.contextCurrent ? "yes" : "no");
+          ", contextCurrent=" + (status.contextCurrent ? "yes" : "no") +
+          ", rebindPending=" + (status.surfaceRebindPending ? "yes" : "no");
       if (!status.lastEglIssue.empty()) heartbeat += ", lastGraphicsIssue=" + status.lastEglIssue;
       logRunEvent(heartbeat);
     }
 
+    // 5. Pacing with the automatic 30 FPS fallback.
+    const auto frameDuration = std::chrono::nanoseconds(
+        (1000000000LL * guestInterval * fallbackMultiplier) / kBaseFps);
     nextFrame += frameDuration;
     auto now = Clock::now();
     if (nextFrame > now) {
-      std::this_thread::sleep_for(nextFrame - now);
+      missedDeadlines = 0;
+      std::this_thread::sleep_until(nextFrame);
     } else {
       // We fell behind; reset pace instead of spiralling.
       nextFrame = now;
+      if (++missedDeadlines >= kMissedDeadlinesBeforeFallback && fallbackMultiplier == 1) {
+        fallbackMultiplier = 2;
+        missedDeadlines = 0;
+        logRunEvent("engine frame heartbeat missed " + std::to_string(kMissedDeadlinesBeforeFallback) +
+                    " consecutive 60 FPS deadlines; falling back to a 30 FPS heartbeat");
+      }
     }
   }
   g_uiLoopActive.store(false, std::memory_order_release);
+  // Release the EGL binding on the render thread that owns it, so a later Surface change or a
+  // follow-up run in this same process cannot collide with a stale cross-thread binding
+  // (the other 0x3002 source).
+  {
+    std::lock_guard<std::mutex> lock(g_bridgeMutex);
+    if (g_eglOwnerTid == hostThreadId()) {
+      NativeGles& ng = nativeGles();
+      if (ng.eglMakeCurrent && ng.eglGetCurrentContext && g_dummyEAGLContext.eglDisplay &&
+          ng.eglGetCurrentContext() == reinterpret_cast<void*>(g_dummyEAGLContext.eglContext)) {
+        ng.eglMakeCurrent(reinterpret_cast<void*>(g_dummyEAGLContext.eglDisplay), nullptr, nullptr, nullptr);
+      }
+      g_eglOwnerTid = 0;
+      g_dummyEAGLContext.isCurrent = 0;
+    }
+    g_eglRebindPending.store(false, std::memory_order_relaxed);
+  }
   GraphicsStatus finalStatus = currentGraphicsStatus();
   logRunEvent("UIApplicationMain exited after " + std::to_string(frames) +
-      " loop frames and " + std::to_string(finalStatus.presentedFrames) + " successful EGL swaps");
+      " loop frames, " + std::to_string(finalStatus.presentedFrames) + " successful EGL swaps and " +
+      std::to_string(finalStatus.engineForcedSwaps) + " engine-forced presents");
   appendGuestOutput("[radeki] UIApplicationMain: event loop exiting\n");
   return g_uiLoopExitCode.load(std::memory_order_relaxed);
 }

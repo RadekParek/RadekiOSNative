@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1163,6 +1164,15 @@ TEST(sandbox_and_eagl_gles_bridge) {
   CHECK(std::string(runtime::guestNSHomeDirectory()) == "/storage/emulated/0/RadekiOSNative/sandbox");
   const auto* docPath = static_cast<const char*>(runtime::guestNSSearchPathForDirectoriesInDomains(9, 1, 1));
   CHECK(docPath && std::string(docPath) == "/storage/emulated/0/RadekiOSNative/sandbox/Documents");
+  // Launch-initialization sandbox verification: the tree (incl. Documents/games/com.mojang)
+  // must exist at the primary external base or one of its fallbacks.
+  auto sandbox = runtime::currentSandboxStatus();
+  CHECK(sandbox.ready);
+  CHECK(sandbox.base == "/storage/emulated/0/RadekiOSNative/sandbox/");
+  CHECK(sandbox.gamesMojangPath.rfind(sandbox.hostBase, 0) == 0);
+  CHECK(sandbox.gamesMojangPath.find("Documents/games/com.mojang") != std::string::npos);
+  CHECK(sandbox.gamesMojangPath.back() != '/');
+  CHECK(std::filesystem::is_directory(sandbox.gamesMojangPath));
 
   // C/POSIX interceptors (mkdir, fopen, stat, access, open, chdir)
   auto host = runtime::makeHostRuntime();
@@ -1203,6 +1213,79 @@ TEST(sandbox_and_eagl_gles_bridge) {
   CHECK(glGetString && std::string(glGetString(0x1F02)).find("OpenGL ES") != std::string::npos);
 }
 
+// EGL thread ownership + CADisplayLink engine heartbeat: a Surface change arriving on a
+// non-render thread while the render thread owns the EGL binding must be deferred to that
+// render thread (never rebound in place, which raises EGL_BAD_ACCESS 0x3002), the frame loop
+// must invoke the registered CADisplayLink target selector every frame cycle, and the
+// heartbeat must honor the guest's frameInterval (2 -> 30 FPS) with a 30 FPS fallback ladder.
+TEST(egl_surface_rebind_thread_safety_and_heartbeat) {
+  auto host = runtime::makeHostRuntime();
+  using UIMain = int (*)(int, char**, const void*, const void*);
+  auto uiMain = reinterpret_cast<UIMain>(*host.registry.resolve("_UIApplicationMain", ""));
+  using MsgSendFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+  auto msgSend = reinterpret_cast<MsgSendFn>(*host.registry.resolve("_objc_msgSend", ""));
+
+  // MCPE-style registration: a CADisplayLink with target/selector and frameInterval 2.
+  uint64_t dlCls = *host.registry.resolve("_OBJC_CLASS_$_CADisplayLink", "");
+  uint64_t dl = msgSend(dlCls, reinterpret_cast<uint64_t>("displayLinkWithTarget:selector:"), 0x1111, 0x2222, 0, 0);
+  CHECK(dl != 0);
+  msgSend(dl, reinterpret_cast<uint64_t>("setFrameInterval:"), 2, 0, 0, 0);
+  msgSend(dl, reinterpret_cast<uint64_t>("addToRunLoop:forMode:"), 1, 2, 0, 0);
+  CHECK(runtime::caDisplayLinkDefault()->registeredInRunLoop == 1);
+  CHECK(runtime::caDisplayLinkDefault()->frameInterval == 2);
+
+  std::filesystem::path logPath = std::filesystem::temp_directory_path() / "radeki-egl-rebind-test.log";
+  std::filesystem::remove(logPath);
+  runtime::beginRunLog(logPath.string(), true);
+  runtime::takeGuestOutput();
+
+  std::atomic<int> loopResult{-1};
+  std::thread render([&] { loopResult.store(uiMain(1, nullptr, nullptr, nullptr)); });
+
+  // Wait for the event loop to become active on the render thread.
+  bool active = false;
+  for (int i = 0; i < 400 && !active; ++i) {
+    active = runtime::currentGraphicsStatus().eventLoopActive;
+    if (!active) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  CHECK(active);
+
+  // Android Surface changed on THIS (non-render) thread while the render thread owns the EGL
+  // binding: the rebind must be queued for the render thread, not executed here.
+  runtime::updateAndroidEglWindow(nullptr, 640, 480);
+  bool rebindApplied = false;
+  for (int i = 0; i < 400 && !rebindApplied; ++i) {
+    rebindApplied = !runtime::currentGraphicsStatus().surfaceRebindPending;
+    if (!rebindApplied) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  CHECK(rebindApplied);
+
+  // The heartbeat ticks frames and honors frameInterval 2 (60/2 = 30 FPS).
+  auto status = runtime::currentGraphicsStatus();
+  CHECK(status.uiFrames > 0);
+  CHECK(status.heartbeatFps == 30);
+  CHECK(status.displayLinkRegistered);
+
+  runtime::requestExitUiLoop(0);
+  render.join();
+  CHECK(loopResult.load() == 0);
+  runtime::endRunLog();
+
+  auto finalStatus = runtime::currentGraphicsStatus();
+  CHECK(!finalStatus.eventLoopActive);
+  CHECK(!finalStatus.surfaceRebindPending);
+  CHECK(runtime::caDisplayLinkDefault()->timestamp > 0.0);  // advanced by the frame loop
+
+  std::ifstream input(logPath, std::ios::binary);
+  std::string log((std::istreambuf_iterator<char>(input)), {});
+  CHECK(log.find("rebind deferred to the render thread") != std::string::npos);
+  CHECK(log.find("queued EGL surface rebind applied on the render thread") != std::string::npos);
+  CHECK(log.find("CADisplayLink frame callback first invoked") != std::string::npos);
+  std::filesystem::remove(logPath);
+  std::string out = runtime::takeGuestOutput();
+  CHECK(out.find("UIApplicationMain") != std::string::npos);
+}
+
 int main() {
   bytes_bounds(); arm64_encodings(); fat_and_selection(); parse_dyld_info(); parse_chained(); malformed_inputs();
   analysis_report(); link_and_execute(); arm32_parse_and_link(); unresolved_import_traps_with_symbol(); link_refusals(); branch_veneer();
@@ -1213,6 +1296,7 @@ int main() {
   cxx_forward_string_wrappers(); stub_dispatch_trampolines(); relinker_dispatch_stub_mode();
   dyld_stub_mode_honest_reporting(); host_runtime_layer(); run_image_stub_mode();
   sandbox_and_eagl_gles_bridge();
+  egl_surface_rebind_thread_safety_and_heartbeat();
   printf("%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;
 }

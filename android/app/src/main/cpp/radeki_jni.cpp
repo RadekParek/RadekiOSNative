@@ -102,12 +102,18 @@ extern "C" JNIEXPORT void JNICALL Java_org_radekiosnative_recompiler_Native_endR
 extern "C" JNIEXPORT jstring JNICALL Java_org_radekiosnative_recompiler_Native_liveGraphicsStatus(
     JNIEnv* env, jclass) {
   const auto s = runtime::currentGraphicsStatus();
+  const auto sandbox = runtime::currentSandboxStatus();
   JsonWriter j;
   j.beginObject().kvb("eventLoopActive", s.eventLoopActive).kvb("nativeWindowBound", s.nativeWindowBound)
     .kvb("eglReady", s.eglReady).kvb("windowSurface", s.windowSurface)
     .kvb("contextCurrent", s.contextCurrent).kvb("displayLinkRegistered", s.displayLinkRegistered)
+    .kvb("surfaceRebindPending", s.surfaceRebindPending)
     .key("width").num(s.width).key("height").num(s.height)
+    .key("heartbeatFps").num(static_cast<int64_t>(s.heartbeatFps))
     .kvu("uiFrames", s.uiFrames).kvu("successfulSwaps", s.presentedFrames)
+    .kvu("engineForcedSwaps", s.engineForcedSwaps)
+    .kvb("sandboxReady", sandbox.ready).kv("sandboxBase", sandbox.base)
+    .kv("sandboxGamesPath", sandbox.gamesMojangPath)
     .kv("lastGraphicsIssue", s.lastEglIssue).endObject();
   return env->NewStringUTF(j.str().c_str());
 }
@@ -132,9 +138,17 @@ static std::string resultJson(const runtime::RunResult& r) {
   j.key("graphics").beginObject().kvb("eventLoopActive", graphics.eventLoopActive)
     .kvb("nativeWindowBound", graphics.nativeWindowBound).kvb("eglReady", graphics.eglReady)
     .kvb("windowSurface", graphics.windowSurface).kvb("contextCurrent", graphics.contextCurrent)
-    .kvb("displayLinkRegistered", graphics.displayLinkRegistered).key("width").num(graphics.width)
-    .key("height").num(graphics.height).kvu("uiFrames", graphics.uiFrames)
-    .kvu("successfulSwaps", graphics.presentedFrames).kv("lastGraphicsIssue", graphics.lastEglIssue).endObject();
+    .kvb("displayLinkRegistered", graphics.displayLinkRegistered)
+    .kvb("surfaceRebindPending", graphics.surfaceRebindPending)
+    .key("width").num(graphics.width)
+    .key("height").num(graphics.height).key("heartbeatFps").num(static_cast<int64_t>(graphics.heartbeatFps))
+    .kvu("uiFrames", graphics.uiFrames)
+    .kvu("successfulSwaps", graphics.presentedFrames).kvu("engineForcedSwaps", graphics.engineForcedSwaps)
+    .kv("lastGraphicsIssue", graphics.lastEglIssue).endObject();
+  const auto sandbox = runtime::currentSandboxStatus();
+  j.key("sandbox").beginObject().kvb("ready", sandbox.ready).kv("base", sandbox.base)
+    .kv("hostBase", sandbox.hostBase).kvb("usingFallback", sandbox.usingFallback)
+    .kv("gamesMojangPath", sandbox.gamesMojangPath).endObject();
   j.endObject();
   return j.str();
 }
@@ -146,6 +160,16 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_radekiosnative_recompiler_Native_r
   try {
     runtime::logRunEvent(std::string("native run requested for ") + (p ? p : "<null path>"));
     runtime::ensureSandboxDirectories();
+    {
+      // Launch-initialization verification: the sandbox tree (including the MCPE
+      // Documents/games/com.mojang data folder) must exist at the primary external path or one
+      // of its fallbacks before any guest code runs.
+      const auto sandbox = runtime::currentSandboxStatus();
+      runtime::logRunEvent(std::string("launch sandbox check: ready=") +
+          (sandbox.ready ? "yes" : "no") + ", base=" + sandbox.base +
+          (sandbox.usingFallback ? " (external fallback: " + sandbox.hostBase + ")" : "") +
+          ", com.mojang=" + (sandbox.ready ? sandbox.gamesMojangPath : std::string("missing")));
+    }
     if (!p) throw FormatError("missing executable path");
     std::ifstream f(p, std::ios::binary);
     if (!f) throw FormatError("cannot open extracted executable");

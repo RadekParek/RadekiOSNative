@@ -45,6 +45,17 @@ void setSandboxBasePath(const std::string& path);
 std::vector<std::string> standardSandboxDirectories();
 // Automatically constructs the standard iOS container directories if they do not exist.
 bool ensureSandboxDirectories();
+// Verified sandbox state, checked during launch initialization and surfaced in the Android
+// diagnostics and the durable run report: the tree (including Documents/games/com.mojang/)
+// must exist at the primary base or one of the external fallbacks.
+struct SandboxStatus {
+  bool ready = false;           // the full standard tree exists at the active host base
+  std::string base;             // logical sandbox base the guest sees (NSHomeDirectory)
+  std::string hostBase;         // actual host location backing it (differs when falling back)
+  bool usingFallback = false;   // primary /storage/emulated/0 base was not writable
+  std::string gamesMojangPath;  // host path of Documents/games/com.mojang (MCPE data folder)
+};
+SandboxStatus currentSandboxStatus();
 // Rewrites a guest iOS filesystem path into the sandbox folder.
 std::string translateGuestPath(const std::string& guestPath);
 // Maps a logical sandbox path onto the writable host filesystem path (identical on Android

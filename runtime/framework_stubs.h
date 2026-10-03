@@ -131,10 +131,15 @@ struct GraphicsStatus {
   bool windowSurface = false;
   bool contextCurrent = false;
   bool displayLinkRegistered = false;
+  // A Surface change arrived on a non-render thread while the EGL binding is owned by the
+  // render thread; the rebind is queued and will run there at the next frame boundary.
+  bool surfaceRebindPending = false;
   int width = 0;
   int height = 0;
+  uint32_t heartbeatFps = 60;      // current CADisplayLink/engine frame heartbeat target
   uint64_t uiFrames = 0;
-  uint64_t presentedFrames = 0;
+  uint64_t presentedFrames = 0;    // successful eglSwapBuffers calls ("successfulSwaps")
+  uint64_t engineForcedSwaps = 0;  // frames the loop presented itself after the render step
   std::string lastEglIssue;
 };
 GraphicsStatus currentGraphicsStatus();

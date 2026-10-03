@@ -3,6 +3,48 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - EGL render-thread ownership, CADisplayLink heartbeat and frame presenting
+
+Host suite: **540 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
+
+- Fixed the EGL_BAD_ACCESS (0x3002) failure class around Android Surface changes. The bridge
+  records which thread owns the EGL binding (the guest's main/render thread, designated by
+  `EAGLContext setCurrentContext:` and the `UIApplicationMain` shim). `bindSurface` /
+  `surfaceChanged` arriving on the Android UI thread no longer rebuild the EGL surface in
+  place: the rebind is queued and applied by the render thread at the next frame boundary, so
+  every `eglMakeCurrent` the bridge issues runs on the render thread. Before each
+  `eglSwapBuffers` and before rebuilding a surface, `eglGetCurrentContext()` is compared with
+  the managed EGLContext; on mismatch the current context is explicitly unbound with
+  `eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)` before rebinding.
+  The frame loop also releases the binding on exit, so a follow-up run in the same process
+  cannot collide with a stale cross-thread binding.
+- The `UIApplicationMain` loop is now a proper CADisplayLink / engine frame heartbeat: a 60 FPS
+  target, the guest's `setFrameInterval:` is honored, and after 60 consecutive missed
+  deadlines (~1 s) the heartbeat permanently falls back to 30 FPS for that run. The registered
+  CADisplayLink target selector is invoked every frame cycle (registration and the first
+  callback are logged), and each frame advances the display-link timestamp/duration the guest
+  reads. Live status exposes the new `heartbeatFps`, `surfaceRebindPending` and
+  `engineForcedSwaps` fields.
+- Frames are presented after every render step: immediately after the CADisplayLink callback
+  returns, the loop calls `eglSwapBuffers(display, surface)` when the guest did not already
+  present through `presentRenderbuffer:`. Successful swaps keep incrementing
+  `successfulSwaps` (plus the new `engineForcedSwaps` counter for loop-presented frames), the
+  first presented frame is logged once, and the RTLS heartbeat reports both counters.
+- Sandbox creation at launch is verified, not just attempted: `ensureSandboxDirectories()`
+  stats the complete tree (including `Documents/games/com.mojang/`) at the primary
+  `/storage/emulated/0/RadekiOSNative/sandbox/` base and its scoped-storage / host-temp
+  fallbacks, then logs which base is active (deduplicated, so the frequent ensure calls cannot
+  spam). The JNI run path logs a launch sandbox check, the final result JSON carries a
+  `sandbox` object, and the black-screen panel flags a missing tree.
+- New host coverage (518 -> 540 checks): the deferral state machine runs across two real
+  threads (a Surface change on a foreign thread must defer and the render loop must apply it),
+  the 30 FPS cadence from `frameInterval = 2`, the CADisplayLink first-callback log, and
+  `SandboxStatus` verification of the on-disk tree. Android-target sources pass a
+  `-D__ANDROID__ -fsyntax-only` sweep with simulated Android headers; the NDK/Gradle build is
+  confirmed by CI. What is still not verified: real device execution - the CADisplayLink
+  callback reaches the objc_msgSend shim, but actual guest method dispatch (and therefore real
+  MCPE frames on screen) needs the still-missing Objective-C runtime.
+
 ## 2026-10-03 - Persistent run diagnostics, opt-in RTLS and ARM32 edition
 
 Host suite: **518 checks, 0 failures**, clean under `make SAN=1 test` after a clean rebuild.
