@@ -49,8 +49,8 @@ jobs:
       - name: Report the first build errors
         if: failure()
         run: |
-          grep -aE 'error:|error \[|FAILURE:|What went wrong|Caused by:|Execution failed|CMake Error|ninja: error|undefined reference|ld: error|> Task .*FAILED' \
-            "$RUNNER_TEMP/gradle.log" | head -40 > "$RUNNER_TEMP/excerpt.txt" || true
+          grep -aA 4 -E 'error:|error \[|FAILURE:|What went wrong|Caused by:|Execution failed|CMake Error' \
+            "$RUNNER_TEMP/gradle.log" | head -60 > "$RUNNER_TEMP/excerpt.txt" || true
           test -s "$RUNNER_TEMP/excerpt.txt" || tail -40 "$RUNNER_TEMP/gradle.log" > "$RUNNER_TEMP/excerpt.txt"
           while IFS= read -r line; do echo "::error::$line"; done < "$RUNNER_TEMP/excerpt.txt"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
