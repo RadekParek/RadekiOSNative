@@ -11,13 +11,20 @@
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <array>
 #include <cstring>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -28,6 +35,17 @@ namespace radeki::runtime {
 namespace {
 
 std::mutex g_runMutex;
+std::mutex g_runLogMutex;
+std::mutex g_rtlsCallsMutex;
+std::unordered_set<std::string> g_rtlsCallNames;
+std::atomic<bool> g_rtlsEnabled{false};
+int g_runLogFd = -1;
+uint64_t g_runLogBytes = 0;
+bool g_runLogTruncated = false;
+std::chrono::steady_clock::time_point g_runLogStarted;
+uint64_t g_rtlsCallCount = 0;
+constexpr uint64_t kMaxRunLogBytes = 4ull * 1024 * 1024;
+constexpr size_t kMaxRtlsCallNames = 256;
 sigjmp_buf g_jmp;
 volatile sig_atomic_t g_active = 0;
 volatile sig_atomic_t g_sigCaught = 0;
@@ -50,6 +68,8 @@ uint64_t pcOf(void* ctx) {
   auto* uc = static_cast<ucontext_t*>(ctx);
 #if defined(__aarch64__)
   return uc->uc_mcontext.pc;
+#elif defined(__arm__)
+  return uc->uc_mcontext.arm_pc;
 #elif defined(__x86_64__)
   return static_cast<uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
 #else
@@ -64,6 +84,8 @@ void onSignal(int sig, siginfo_t* si, void* ctx) {
     g_pc = pcOf(ctx);
 #if defined(__aarch64__)
     g_lr = static_cast<ucontext_t*>(ctx)->uc_mcontext.regs[30];
+#elif defined(__arm__)
+    g_lr = static_cast<ucontext_t*>(ctx)->uc_mcontext.arm_lr;
 #else
     g_lr = 0;
 #endif
@@ -88,6 +110,51 @@ const char* sigName(int s) {
     case SIGTRAP: return "SIGTRAP";
     default: return "signal";
   }
+}
+
+bool hostCanRunArch(macho::Arch arch) {
+#if defined(__aarch64__)
+  return arch == macho::Arch::ARM64 || arch == macho::Arch::ARM64e;
+#elif defined(__arm__)
+  return relinker::isArm32Architecture(arch);
+#else
+  (void)arch;
+  return false;
+#endif
+}
+
+std::string hostArchError(macho::Arch arch) {
+#if defined(__aarch64__)
+  if (relinker::isArm32Architecture(arch))
+    return "ARM32 guest code requires the ARM32 edition; it cannot execute inside an ARM64 process";
+  return "guest execution requires an ARM64 host; this build cannot execute the selected architecture";
+#elif defined(__arm__)
+  if (arch == macho::Arch::ARM64 || arch == macho::Arch::ARM64e)
+    return "ARM64 guest code requires the ARM64 edition; it cannot execute inside an ARM32 process";
+  return "guest execution requires an ARM32 host; this build cannot execute the selected architecture";
+#else
+  (void)arch;
+  return "guest execution requires an ARM64 host; this build runs on a different CPU architecture";
+#endif
+}
+
+bool matchesTrapPc(const relinker::LinkedImage& image, const relinker::Trap& trap,
+                   uint64_t pc, int signal) {
+  if (trap.addr == pc) return true;
+  // A32 BKPT reports the architectural PC after the four-byte instruction on Linux.
+  return relinker::isArm32Architecture(image.arch) && signal == SIGTRAP &&
+         trap.addr <= UINT64_MAX - 4 && trap.addr + 4 == pc;
+}
+
+uint64_t readGuestPointer(const relinker::LinkedImage& image, uint64_t address) {
+  if (relinker::isArm32Architecture(image.arch)) {
+    uint32_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof value);
+    return value;
+  }
+  uint64_t value = 0;
+  std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof value);
+  return value;
 }
 
 struct Job {
@@ -142,7 +209,7 @@ struct Job {
   if (sigsetjmp(g_jmp, 1) == 0) {
     g_active = 1;
     for (uint64_t slot : li.initPointerSlots) {
-      uint64_t fn = *reinterpret_cast<uint64_t*>(slot);
+      uint64_t fn = readGuestPointer(li, slot);
       if (!fn) continue;
       // Name the constructor in the compat-call trace so a fault inside __GLOBAL__I_* is
       // attributable without a debugger (e.g. __GLOBAL__I_a17 at the MCPE halt site).
@@ -168,7 +235,7 @@ struct Job {
       res.threadId = g_guestTid;
       res.recentCalls = recentCompatCalls();
       for (const auto& t : li.traps)
-        if (t.addr == g_pc) { res.trapSymbol = t.symbol; res.trapClass = "UNSUPPORTED"; res.resolutionMethod = "trap";
+        if (matchesTrapPc(li, t, g_pc, g_sigCaught)) { res.trapSymbol = t.symbol; res.trapClass = "UNSUPPORTED"; res.resolutionMethod = "trap";
           for (const auto& b : li.imports) if (b.symbol == t.symbol && b.trapIndex == int(t.index)) {
             res.subsystem = b.framework.empty() ? b.dylib : b.framework; break;
           }
@@ -183,7 +250,99 @@ struct Job {
   return nullptr;
 }
 
+void writeRunLogLocked(std::string_view text) {
+  if (g_runLogFd < 0 || text.empty() || g_runLogTruncated) return;
+  const uint64_t available = g_runLogBytes < kMaxRunLogBytes ? kMaxRunLogBytes - g_runLogBytes : 0;
+  if (text.size() > available) {
+    static constexpr std::string_view marker =
+        "\n[radeki] Run log reached its 4 MiB safety limit; later events were omitted.\n";
+    const size_t contentBytes = available > marker.size() ? size_t(available - marker.size()) : 0;
+    text = text.substr(0, contentBytes);
+    // The marker is written below after the remaining content.
+    auto writeAll = [](int fd, std::string_view bytes) {
+      size_t offset = 0;
+      while (offset < bytes.size()) {
+        ssize_t n = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return size_t(0);
+        offset += static_cast<size_t>(n);
+      }
+      return offset;
+    };
+    g_runLogBytes += writeAll(g_runLogFd, text);
+    if (g_runLogBytes + marker.size() <= kMaxRunLogBytes)
+      g_runLogBytes += writeAll(g_runLogFd, marker);
+    g_runLogTruncated = true;
+    return;
+  }
+  size_t offset = 0;
+  while (offset < text.size()) {
+    ssize_t n = ::write(g_runLogFd, text.data() + offset, text.size() - offset);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return;
+    offset += static_cast<size_t>(n);
+    g_runLogBytes += static_cast<size_t>(n);
+  }
+}
+
 }  // namespace
+
+void beginRunLog(const std::string& path, bool realtimeLogging) {
+  endRunLog();
+  if (path.empty()) return;
+  int fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0) return;
+  struct stat st{};
+  uint64_t existingBytes = ::fstat(fd, &st) == 0 && st.st_size > 0 ? static_cast<uint64_t>(st.st_size) : 0;
+  {
+    std::lock_guard<std::mutex> lock(g_runLogMutex);
+    g_runLogFd = fd;
+    g_runLogBytes = existingBytes;
+    g_runLogTruncated = existingBytes >= kMaxRunLogBytes;
+    g_runLogStarted = std::chrono::steady_clock::now();
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_rtlsCallsMutex);
+    g_rtlsCallNames.clear();
+    g_rtlsCallCount = 0;
+  }
+  g_rtlsEnabled.store(realtimeLogging, std::memory_order_release);
+  logRunEvent(realtimeLogging ? "RTLS connected (sampled compatibility calls and frame heartbeats enabled)"
+                              : "runtime log connected (RTLS detail disabled)");
+}
+
+void endRunLog() {
+  g_rtlsEnabled.store(false, std::memory_order_release);
+  std::lock_guard<std::mutex> lock(g_runLogMutex);
+  if (g_runLogFd >= 0) {
+    ::fsync(g_runLogFd);
+    ::close(g_runLogFd);
+    g_runLogFd = -1;
+  }
+}
+
+void writeRunLog(const std::string& text) {
+  if (text.empty()) return;
+  std::lock_guard<std::mutex> lock(g_runLogMutex);
+  writeRunLogLocked(text);
+}
+
+void logRunEvent(const std::string& event) {
+  if (event.empty()) return;
+  uint64_t elapsedMs = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_runLogMutex);
+    if (g_runLogFd < 0) return;
+    elapsedMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_runLogStarted).count());
+    std::string line = "[+" + std::to_string(elapsedMs) + " ms] " + event + "\n";
+    writeRunLogLocked(line);
+  }
+}
+
+bool realtimeLoggingEnabled() {
+  return g_rtlsEnabled.load(std::memory_order_acquire);
+}
 
 void abortGuest(int code, const char* reason) {
   g_exitCode = code;
@@ -194,13 +353,13 @@ void abortGuest(int code, const char* reason) {
   siglongjmp(g_jmp, 1);
 }
 
-RunResult run([[maybe_unused]] const relinker::LinkedImage& li) {
+RunResult run(const relinker::LinkedImage& li) {
   ensureSandboxDirectories();
-#if !defined(__aarch64__)
-  RunResult r;
-  r.error = "guest execution requires an ARM64 host; this build runs on a different CPU architecture";
-  return r;
-#else
+  if (!hostCanRunArch(li.arch)) {
+    RunResult result;
+    result.error = hostArchError(li.arch);
+    return result;
+  }
   std::lock_guard<std::mutex> lock(g_runMutex);
   resetRecentCompatCalls();
   Job job{&li, {}};
@@ -216,7 +375,6 @@ RunResult run([[maybe_unused]] const relinker::LinkedImage& li) {
   pthread_attr_destroy(&attr);
   job.res.output = takeGuestOutput();
   return job.res;
-#endif
 }
 
 namespace {
@@ -309,7 +467,7 @@ namespace {
       }
       auto runInits = [&](const relinker::LinkedImage& lim) {
         for (uint64_t slot : lim.initPointerSlots) {
-          uint64_t fn = *reinterpret_cast<uint64_t*>(slot);
+          uint64_t fn = readGuestPointer(lim, slot);
           if (!fn) continue;
           char hex[24];
           std::snprintf(hex, sizeof hex, "0x%llx", static_cast<unsigned long long>(fn));
@@ -350,7 +508,7 @@ namespace {
         for (const auto& e : images)
           if (e->linked)
             for (const auto& t : e->linkedImage.traps)
-              if (t.addr == g_pc) ir.trapSymbol = t.symbol;
+              if (matchesTrapPc(e->linkedImage, t, g_pc, g_sigCaught)) ir.trapSymbol = t.symbol;
       } else {
         ir.ran = true;
         ir.exitCode = g_exitCode;
@@ -386,19 +544,23 @@ MultiRunResult runLoadedImage(loader::Registry& reg, const loader::Options& opt)
           ++out.dispatchStubs;
           if (out.stubbed.size() < 64) out.stubbed.push_back(b.symbol);
         }
-#if !defined(__aarch64__)
-  for (size_t i = 0; i < images.size(); ++i) {
-    out.images[i].path = images[i]->path;
-    out.images[i].skipped = true;
-    out.images[i].error = "guest execution requires an ARM64 host";
-  }
-  if (out.error.empty()) out.error = "guest execution requires an ARM64 host; this build runs on a different CPU architecture";
-  return out;
-#else
   if (images.empty()) {
     if (out.error.empty()) out.error = "no images to run";
     return out;
   }
+  bool hostCanRunAll = true;
+  for (size_t i = 0; i < images.size(); ++i) {
+    out.images[i].path = images[i]->path;
+    const macho::Arch arch = images[i]->linked ? images[i]->linkedImage.arch
+                                               : images[i]->image ? images[i]->image->arch : macho::Arch::Unknown;
+    if (!hostCanRunArch(arch)) {
+      hostCanRunAll = false;
+      out.images[i].skipped = true;
+      out.images[i].error = hostArchError(arch);
+      if (out.error.empty()) out.error = out.images[i].error;
+    }
+  }
+  if (!hostCanRunAll) return out;
   {
     std::lock_guard<std::mutex> lock(g_runMutex);
     struct Job {
@@ -421,7 +583,6 @@ MultiRunResult runLoadedImage(loader::Registry& reg, const loader::Options& opt)
   }
   out.output = takeGuestOutput();
   return out;
-#endif
 }
 
 RunResult runImage(const macho::Image& img, bool useStubs) {
@@ -437,10 +598,15 @@ RunResult runImage(const macho::Image& img, bool useStubs) {
     plainRegistry.emplace(makeCompatRegistry());
     resolver = &*plainRegistry;
   }
-  const uint64_t candidates[] = {img.textBase(), 0x300000000ull, 0x500000000ull, 0x900000000ull};
+  std::vector<uint64_t> candidates{img.textBase()};
+  if (relinker::isArm32Architecture(img.arch))
+    candidates.insert(candidates.end(), {0x10000000, 0x20000000, 0x40000000, 0x60000000});
+  else
+    candidates.insert(candidates.end(), {0x300000000ull, 0x500000000ull, 0x900000000ull});
+  const uint64_t pageSize = relinker::pageSizeForArch(img.arch);
   RunResult last;
   for (uint64_t base : candidates) {
-    if (base % relinker::kPageSize) continue;
+    if (base % pageSize || (relinker::isArm32Architecture(img.arch) && base > UINT32_MAX)) continue;
     relinker::LinkOptions o;
     o.loadBase = base;
     o.resolver = resolver;
@@ -516,10 +682,27 @@ void recordCompatCall(const char* name) {
   if (len) std::memcpy(dest.data(), name, len);
   dest[len] = '\0';
 }
+
+void recordRtlsCompatCall(const char* name) {
+  if (!name || !realtimeLoggingEnabled()) return;
+  bool shouldLog = false;
+  {
+    std::lock_guard<std::mutex> lock(g_rtlsCallsMutex);
+    ++g_rtlsCallCount;
+    if (g_rtlsCallNames.size() < kMaxRtlsCallNames)
+      shouldLog = g_rtlsCallNames.emplace(name).second;
+    else
+      shouldLog = g_rtlsCallCount % 4096 == 0;
+  }
+  if (shouldLog) logRunEvent(std::string("compat call: ") + name);
+}
 }  // namespace
 
-void noteCompatCall(const char* name) { recordCompatCall(name); }
-void noteCompatCall(const std::string& name) { recordCompatCall(name.c_str()); }
+void noteCompatCall(const char* name) {
+  recordCompatCall(name);
+  recordRtlsCompatCall(name);
+}
+void noteCompatCall(const std::string& name) { noteCompatCall(name.c_str()); }
 
 std::vector<std::string> recentCompatCalls() {
   std::lock_guard<std::mutex> lock(callsMutex);

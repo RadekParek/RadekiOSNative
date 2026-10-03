@@ -34,9 +34,15 @@ struct Spec {
   bool global = true;                  // visible to flat (ordinal 0 / -2) lookups
 };
 
+#if defined(__arm__) && !defined(__aarch64__)
+inline constexpr uint64_t kDefaultFirstBase = 0x10000000;
+#else
+inline constexpr uint64_t kDefaultFirstBase = 0x300000000ull;
+#endif
+
 struct Options {
-  uint64_t firstBase = 0x300000000ull;  // must be 16K aligned
-  uint64_t spacing = 0x4000000ull;      // gap between images, multiple of 16K
+  uint64_t firstBase = kDefaultFirstBase;  // low 32-bit range for ARMv7; 16K aligned for ARM64
+  uint64_t spacing = 0x4000000ull;         // gap between images, multiple of 4K/16K
   uint32_t veneerSlots = 64;
   // Consulted after the loaded images: this is where the host-side runtime layer goes --
   // the compat libSystem subset, the libc++ -> Android libc++_shared forwarding table, and

@@ -4,13 +4,11 @@
 // When the linker runs with a StubFactory (loader::Options::stubFactory), every unresolved
 // strong import is bound to a host-side object produced here instead of a trap stub:
 //
-//   * code imports  -> a 32-byte AArch64 trampoline emitted in an RW->RX arena:
-//                        LDR x9,  =StubRecord*     ; which symbol was called
-//                        LDR x16, =dispatch entry  ; shared dispatcher
-//                        BR  x16
+//   * code imports  -> a host-ABI trampoline emitted in an RW->RX arena (32-byte AArch64 or
+//                      44-byte A32). It preserves the caller's argument registers, supplies a
+//                      StubRecord to the shared dispatcher and restores its return value.
 //                      The dispatcher logs the symbol (once, then sampled), and returns a safe
-//                      default: 0/NULL/nil, 1/YES, the caller's x0 (id pass-through for the
-//                      objc retain family / objc_msgSend), or an empty SEL pointer.
+//                      default: 0/NULL/nil, 1/YES, the caller's first argument or an empty SEL.
 //   * data imports  -> dummy objects: zeroed objc-class-shaped blocks for _OBJC_CLASS_$_ /
 //                      _OBJC_METACLASS_$_ symbols (labelled with the class name), and labelled
 //                      zero blocks for constants (_kCF..., ...Notification, NSConcrete*Block).
@@ -30,7 +28,7 @@ namespace radeki::runtime {
 enum class StubReturn : uint8_t {
   Zero,      // 0 / NULL / nil -- the safe default
   One,       // YES
-  Arg0,      // pass the caller's x0 through (objc_retain family, objc_msgSend, sel_registerName)
+  Arg0,      // pass the caller's first argument through (objc_retain family / selector helpers)
   EmptySel,  // pointer to a static empty C string (SEL-like)
 };
 
@@ -50,10 +48,10 @@ StubReturn classifyStubReturn(const std::string& symbol);
 // True when the symbol is a data import (class objects, ObjC block classes, constants).
 bool stubLooksLikeData(const std::string& symbol);
 
-// The C half of the dispatcher; also called directly by the tests. `originalX0` is the
-// caller's x0 (first argument register), needed for Arg0 pass-through decisions.
+// The C half of the dispatcher; also called directly by tests. `originalX0` carries the
+// caller's first pointer-sized argument for Arg0 pass-through decisions.
 extern "C" uint64_t radekiStubDispatchC(StubRecord* rec, uint64_t originalX0);
-// Address the trampolines branch to (the naked AArch64 entry, or a fallback elsewhere).
+// Address the trampolines branch to (AArch64/A32 entry points, or a non-ARM test fallback).
 uint64_t stubDispatchEntryAddress();
 
 class StubArena {

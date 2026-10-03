@@ -1,5 +1,6 @@
-// Runtime: maps a relinked ARM64 image into this process and executes the ORIGINAL AArch64 code natively.
-// Only works on an ARM64 host (Android arm64-v8a). On other hosts run() reports that clearly.
+// Runtime: maps a relinked ARM64 or ARMv7 image into the matching native Android process and
+// executes the ORIGINAL AArch64/AArch32 code. ARM32 guests require the separate armeabi-v7a APK;
+// AArch32 and AArch64 instructions are never mixed inside one process.
 #pragma once
 #include <cstdint>
 #include <string>
@@ -81,6 +82,16 @@ struct HostRuntime {
 HostRuntime makeHostRuntime();
 
 std::string describeResult(const RunResult&);
+
+// The Android launcher opens one private per-run file before binding its Surface. Guest output,
+// EGL/runtime events and optional RTLS call samples are appended as they happen. Logging is
+// inert when no run-log file is active; RTLS adds sampled detail and heartbeats when enabled.
+void beginRunLog(const std::string& path, bool realtimeLogging);
+void endRunLog();
+void writeRunLog(const std::string& text);
+void logRunEvent(const std::string& event);
+bool realtimeLoggingEnabled();
+
 // Keep literal-name tracing cheap in hot compatibility wrappers: the const-char overload
 // avoids constructing a temporary std::string for each guest call.
 void noteCompatCall(const char*);
@@ -124,7 +135,7 @@ struct MultiRunResult {
 // the compat libSystem) and runs them inside ONE process: a single reservation covers every
 // image, so their slides are what dyld would give them, and cross-image pointers resolve.
 // Images are started in the registry's link order (dependencies before importers).
-// Like run(), this needs an ARM64 host; elsewhere it reports why instead of pretending.
+// Like run(), this requires the process ABI to match every linked guest image; mismatches are reported.
 MultiRunResult runLoadedImage(loader::Registry& reg, const loader::Options& opt);
 
 }  // namespace radeki::runtime

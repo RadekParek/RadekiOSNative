@@ -11,7 +11,10 @@ target_compile_options(radeki PRIVATE -Wall -Wextra)
 # Bionic's __android_log_write (guest output on the device) lives in liblog, which the NDK never
 # links implicitly; without it the Android link of any radeki consumer fails on that symbol.
 if(ANDROID)
-  target_link_libraries(radeki PUBLIC log)
+  target_link_libraries(radeki PUBLIC log dl)
+  if(ANDROID_ABI STREQUAL "armeabi-v7a")
+    target_link_libraries(radeki PUBLIC atomic)
+  endif()
 endif()
 add_executable(radeki_cli tools/radeki.cpp)
 set_target_properties(radeki_cli PROPERTIES OUTPUT_NAME radeki)

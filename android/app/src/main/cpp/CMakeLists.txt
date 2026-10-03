@@ -9,3 +9,7 @@ add_library(radekijni SHARED radeki_jni.cpp ${R}/mach_o/macho.cpp ${R}/binary_an
                             ${R}/compat/status.cpp ${R}/compat/matrix.cpp ${R}/ipa/inflate.cpp ${R}/ipa/png.cpp ${R}/ipa/plist.cpp ${R}/ipa/bundle.cpp)
 target_include_directories(radekijni PRIVATE ${R} ${R}/tests)
 target_link_libraries(radekijni log dl EGL GLESv2 android)
+if(ANDROID_ABI STREQUAL "armeabi-v7a")
+  # 64-bit std::atomic operations are outlined by Clang on ARMv7 and supplied by libatomic.
+  target_link_libraries(radekijni atomic)
+endif()

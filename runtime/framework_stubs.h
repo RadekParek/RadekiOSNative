@@ -21,6 +21,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "relinker/relinker.h"
 
@@ -121,6 +122,22 @@ void injectTouchEvent(int action, float x, float y, int64_t timestampMs);
 
 // Query the current EGL/drawable size (for glViewport / renderbufferStorage).
 void eglDrawableSize(int* outWidth, int* outHeight);
+
+// Snapshot used by the Android black-screen overlay and included in the durable run report.
+struct GraphicsStatus {
+  bool eventLoopActive = false;
+  bool nativeWindowBound = false;
+  bool eglReady = false;
+  bool windowSurface = false;
+  bool contextCurrent = false;
+  bool displayLinkRegistered = false;
+  int width = 0;
+  int height = 0;
+  uint64_t uiFrames = 0;
+  uint64_t presentedFrames = 0;
+  std::string lastEglIssue;
+};
+GraphicsStatus currentGraphicsStatus();
 
 DummyUIWindow* uiWindowDefault();
 int uiWindowMakeKeyAndVisible(void* window);

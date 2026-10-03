@@ -7,6 +7,9 @@ public class Native {
     public static native String analyze(String path);
     public static native String run(String path, boolean compatibilityFallbacks, boolean traceMissingApis);
     public static native String selfTest();
+    public static native void beginRunLog(String path, boolean realtimeLogging);
+    public static native void endRunLog();
+    public static native String liveGraphicsStatus();
     public static native String inspectBundle(String appPath, String iconPath);
     // EGL / Surface binding (drives eglCreateWindowSurface + eglSwapBuffers for game rendering).
     public static native void bindSurface(Surface surface, int width, int height);

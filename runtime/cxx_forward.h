@@ -6,11 +6,10 @@
 // the loader's fallback resolver:
 //
 //  1. An explicit mapping table (cxxForwardTable): Apple's exact mangled symbol names mapped
-//     to written wrappers that speak Apple's ABI directly (no host std::string reinterpret --
-//     the host may be libstdc++, which has a different layout). basic_string
-//     allocation/initialization (__init, constructors, destructor, assign/append/reserve...)
-//     and ios_base::Init are covered so static global constructors (__GLOBAL__I_*) complete
-//     without hitting trap instructions.
+//     to written wrappers that speak the guest's pointer-width libc++ ABI directly (no host
+//     std::string reinterpret -- the host may be libstdc++, which has a different layout).
+//     basic_string allocation/initialization and ios_base::Init are covered so common static
+//     global constructors (__GLOBAL__I_*) can complete without hitting trap instructions.
 //
 //  2. HostCxxResolver: a dlsym(RTLD_DEFAULT) pass-through for remaining _Z-mangled imports
 //     requested from Apple's C++ dylibs. On an Android device this finds the identical
@@ -36,6 +35,9 @@ struct CxxForwardEntry {
 
 // The explicit mapping table. Stable for the process lifetime.
 const std::vector<CxxForwardEntry>& cxxForwardTable();
+// Substitute 32-bit unsigned-long size_t type codes in the supported std::string symbols.
+// Useful for Apple ARMv7 imports, where std::string::size_type has a 32-bit ABI spelling.
+std::string arm32ManglingAlias(const std::string& mangled);
 std::optional<uint64_t> lookupCxxForward(const std::string& mangled);
 // Registers every table entry into a compat registry (classification ANDROID_BACKEND,
 // framework "libc++"). Called from makeCompatRegistry().

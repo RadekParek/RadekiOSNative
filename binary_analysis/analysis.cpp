@@ -30,7 +30,11 @@ Report analyze(const Image& img) {
     }
   if (img.cryptId) rep.blockers.push_back("encrypted_binary: LC_ENCRYPTION_INFO cryptid != 0; encrypted segments are not processed");
   if (img.arch == Arch::ARM64e) rep.blockers.push_back("arm64e: PAC compatibility layer not implemented; auth fixups cannot be linked");
-  if (img.arch == Arch::ARMv7 || img.arch == Arch::ARMv7s) rep.blockers.push_back("armv7: AOT translator not implemented");
+  if (img.arch == Arch::ARMv7 || img.arch == Arch::ARMv7s || img.arch == Arch::ARMv7k) {
+#if !defined(__arm__) || defined(__aarch64__)
+    rep.blockers.push_back("armv7: guest requires the separate 32-bit ARM process; cross-ISA translation is not implemented");
+#endif
+  }
   if (img.arch != Arch::ARM64 && img.arch != Arch::ARM64e) return rep;
 
   std::map<uint64_t, std::string> names;

@@ -25,6 +25,18 @@ jobs:
       - run: cmake --build build-android
       - uses: actions/upload-artifact@v4
         with: { name: radeki-android-arm64, path: build-android/radeki }
+  android-arm32:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (NDK, armeabi-v7a)
+        run: |
+          cmake -S . -B build-android-arm32 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-android-arm32
+      - uses: actions/upload-artifact@v4
+        with: { name: radeki-android-arm32, path: build-android-arm32/radeki }
   apk:
     runs-on: ubuntu-24.04
     steps:
@@ -38,10 +50,10 @@ jobs:
           gradle-version: '8.7'
       # The source tree in the checkout is canonical, so the APK is assembled from it directly:
       # a stale RadekiOSNative.zip can no longer ship an APK that misses recent changes.
-      - name: Assemble arm64-v8a debug APK
+      - name: Assemble ARM64 and ARM32 debug APKs
         run: |
           set -o pipefail
-          gradle -p android assembleDebug --no-daemon --stacktrace --console=plain 2>&1 \
+          gradle -p android assembleArm64Debug assembleArm32Debug --no-daemon --stacktrace --console=plain 2>&1 \
             | tee "$RUNNER_TEMP/gradle.log"
       # Failing Gradle output is otherwise buried in the job log; surface the first errors as
       # annotations so they show up on the run itself (and on the PR's checks).
@@ -52,22 +64,29 @@ jobs:
             "$RUNNER_TEMP/gradle.log" | head -60 > "$RUNNER_TEMP/excerpt.txt" || true
           test -s "$RUNNER_TEMP/excerpt.txt" || tail -40 "$RUNNER_TEMP/gradle.log" > "$RUNNER_TEMP/excerpt.txt"
           while IFS= read -r line; do echo "::error::$line"; done < "$RUNNER_TEMP/excerpt.txt"
-      - name: Stage and verify the APK
+      - name: Stage and verify both APKs
         run: |
-          cp android/app/build/outputs/apk/debug/app-debug.apk RadekiOSNative.apk
-          test -s RadekiOSNative.apk
-          unzip -t RadekiOSNative.apk >/dev/null
-          unzip -l RadekiOSNative.apk > "$RUNNER_TEMP/apk-entries.txt"
-          for entry in AndroidManifest.xml classes.dex resources.arsc lib/arm64-v8a/libradekijni.so; do
-            grep -q " $entry\$" "$RUNNER_TEMP/apk-entries.txt" || { echo "APK is missing $entry"; exit 1; }
+          set -euo pipefail
+          cp android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk RadekiOSNative-arm64.apk
+          cp android/app/build/outputs/apk/arm32/debug/app-arm32-debug.apk RadekiOSNative-arm32.apk
+          for variant in arm64 arm32; do
+            apk="RadekiOSNative-${variant}.apk"
+            test -s "$apk"
+            unzip -t "$apk" >/dev/null
+            unzip -l "$apk" > "$RUNNER_TEMP/${variant}-apk-entries.txt"
+            case "$variant" in
+              arm64) native_entry='lib/arm64-v8a/libradekijni.so' ;;
+              arm32) native_entry='lib/armeabi-v7a/libradekijni.so' ;;
+            esac
+            for entry in AndroidManifest.xml classes.dex resources.arsc "$native_entry"; do
+              grep -q " $entry\$" "$RUNNER_TEMP/${variant}-apk-entries.txt" || { echo "$apk is missing $entry"; exit 1; }
+            done
+            echo "Verified $apk ($native_entry)"
           done
-          echo "Verified APK entries:"
-          grep -E ' AndroidManifest\.xml$| classes\.dex$| resources\.arsc$' "$RUNNER_TEMP/apk-entries.txt"
-          grep -E ' lib/arm64-v8a/' "$RUNNER_TEMP/apk-entries.txt"
       - uses: actions/upload-artifact@v4
         with:
           name: RadekiOSNative-apk
-          path: RadekiOSNative.apk
+          path: RadekiOSNative-*.apk
   release:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: apk
@@ -78,17 +97,22 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: RadekiOSNative-apk
-      - name: Re-check the downloaded APK
+      - name: Re-check the downloaded APKs
         run: |
-          test -s RadekiOSNative.apk
-          unzip -t RadekiOSNative.apk >/dev/null
-          unzip -l RadekiOSNative.apk | grep -q " lib/arm64-v8a/libradekijni.so\$"
-      - name: Publish APK as a release (direct .apk download)
+          set -euo pipefail
+          for entry in 'RadekiOSNative-arm64.apk:lib/arm64-v8a/libradekijni.so' 'RadekiOSNative-arm32.apk:lib/armeabi-v7a/libradekijni.so'; do
+            apk=${entry%%:*}
+            native=${entry#*:}
+            test -s "$apk"
+            unzip -t "$apk" >/dev/null
+            unzip -l "$apk" | grep -q " $native\$"
+          done
+      - name: Publish both APK editions as release assets
         run: |
           gh release create "build-${{ github.run_number }}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Build ${{ github.run_number }}" \
-            --notes "Debug APK (arm64-v8a), built from ${{ github.sha }}." \
-            RadekiOSNative.apk
+            --notes "ARM64 and ARM32 debug APKs built from ${{ github.sha }}." \
+            RadekiOSNative-arm64.apk RadekiOSNative-arm32.apk
         env:
           GH_TOKEN: ${{ github.token }}

@@ -3,6 +3,29 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - Persistent run diagnostics, opt-in RTLS and ARM32 edition
+
+Host suite: **518 checks, 0 failures**, clean under `make SAN=1 test` after a clean rebuild.
+Both Android APK flavors still need the GitHub CI build/verification before this task is complete.
+
+- Added private persistent per-run logs, a recent-run history, a latest-run card, and a scrollable
+  copy/share viewer. Native logs retain guest output, run-stage messages, graphics/Surface state,
+  optional RTLS samples and the structured final result. History is bounded to 30 runs; native logs
+  cap at 4 MiB and the viewer shows at most the latest 512 KiB.
+- Added an RTLS switch that defaults off. With it enabled, sampled missing-API calls and a
+  five-second event-loop/EGL heartbeat are appended during execution; basic output and error logs
+  remain enabled regardless.
+- Added a delayed black-screen diagnostic panel that distinguishes a missing Android Surface,
+  failed EGL startup, off-screen pbuffer fallback, a missing app event loop and a running loop that
+  has not swapped a frame. It provides direct access to the saved run log and a safe exit action.
+- Added ARM32/ARMv7 native-process support alongside ARM64: host-aware Mach-O selection, 4K
+  mappings, pointer-width rebases/binds, A32 BKPT trap stubs, native ABI stub trampolines and a
+  synthetic ARM32 entrypoint self-test. Branch rewriting and PC-relative validation remain
+  unsupported; matching 32-bit and 64-bit images cannot be mixed in one process.
+- Added separate `arm64-v8a` and `armeabi-v7a` Gradle flavors and CI jobs that build both APKs,
+  verify their packaged JNI libraries and publish both editions as release assets. The local
+  environment has no Java/Gradle/Android SDK/NDK, so actual APK verification is pending CI.
+
 ## 2026-10-03 - Restore the APK build (the workflow had lost its `apk` and `release` jobs)
 
 Host suite: **487 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).

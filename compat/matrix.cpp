@@ -3,7 +3,7 @@
 namespace radeki::compat {
 const std::vector<Capability>& capabilityMatrix() {
   static const std::vector<Capability> rows = {
-    {"native_executable","Native executable","loader",Status::Implemented,"ARM64 host required"},
+    {"native_executable","Native executable","loader",Status::Implemented,"Matching native ARM64 or ARMv7 process required"},
     {"macho_loading","Mach-O loading","loader",Status::Implemented,"Supported Mach-O structures"},
     {"relocations","Relocations","relinker",Status::Implemented,"Supported rebases and binds"},
     {"multi_image_loading","Multi-image loading","loader",Status::Implemented,"Dependency ordering and exports"},
@@ -22,7 +22,7 @@ const std::vector<Capability>& capabilityMatrix() {
     {"input","Input","Input",Status::Unsupported,"No input backend"},
     {"networking","Networking","Networking",Status::Unsupported,"No networking backend"},
     {"arm64e_pac","arm64e PAC","CPU",Status::Unsupported,"No PAC emulation"},
-    {"armv7_aot","ARMv7 AOT","CPU",Status::Unsupported,"No ARMv7 translation"},
+    {"armv7_aot","ARMv7 guest edition","CPU",Status::Unsupported,"ARMv7 guests require the separate armeabi-v7a process; cross-ISA execution and AOT translation are unavailable"},
     {"swift","Swift","Swift",Status::Unsupported,"No Swift runtime"}
   };
   return rows;
@@ -33,7 +33,7 @@ std::vector<Capability> neededCapabilities(const Detected& d) {
   add(d.objc,"objc_runtime"); add(d.objc,"foundation");
   add(d.uikit,"uikit"); add(d.corefoundation,"corefoundation"); add(d.vulkan,"vulkan"); add(d.input,"input"); add(d.gles,"opengles");
   add(d.metal,"metal"); add(d.audio,"audio"); add(d.networking,"networking");
-  add(d.swift,"swift"); add(d.arm64e,"arm64e_pac"); add(d.armv7,"armv7_aot");
+  add(d.swift,"swift"); add(d.arm64e,"arm64e_pac"); add(d.armv7 && !d.hostArm32,"armv7_aot");
   std::vector<Capability> result;
   for (const auto& row : capabilityMatrix()) if (std::find(ids.begin(),ids.end(),row.id)!=ids.end()) result.push_back(row);
   return result;

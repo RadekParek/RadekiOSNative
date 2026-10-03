@@ -44,6 +44,42 @@ inline std::vector<uint32_t> code() {
   return c;
 }
 
+inline Buf buildArm32Test() {
+  // Minimal AArch32 Mach-O entry point used by the ARM32 APK's native self-test. It carries
+  // one ordinary pointer rebase and one unresolved bind so tests cover 32-bit relocation slots
+  // and the A32 BKPT diagnostic stub, in addition to executing a tiny ARMv7 function.
+  Buf f(0x3000, 0);
+  Buf lc;
+  auto segment = [&](const char* name, uint32_t vmaddr, uint32_t vmsize,
+                     uint32_t fileoff, uint32_t filesize, uint32_t protection) {
+    put(lc, 0x1); put(lc, 56);              // LC_SEGMENT, 32-bit command
+    putName(lc, name);
+    put(lc, vmaddr); put(lc, vmsize); put(lc, fileoff); put(lc, filesize);
+    put(lc, protection); put(lc, protection); put(lc, 0); put(lc, 0);  // no sections
+  };
+  segment("__TEXT", 0x1000, 0x1000, 0, 0x1000, 5);
+  segment("__DATA", 0x2000, 0x1000, 0x1000, 0x1000, 3);
+  segment("__LINKEDIT", 0x3000, 0x1000, 0x2000, 0x1000, 1);
+  put(lc, 0x80000022); put(lc, 48);        // LC_DYLD_INFO_ONLY
+  put(lc, 0x2000); put(lc, 5);             // rebase info at __LINKEDIT + 0
+  put(lc, 0x2020); put(lc, 19);            // bind info at __LINKEDIT + 0x20
+  for (int i = 0; i < 6; ++i) put(lc, 0);
+  put(lc, 0x80000028); put(lc, 24);        // LC_MAIN
+  put64(lc, 0x200); put64(lc, 0);          // entryoff, stacksize
+  p32(f, 0, 0xFEEDFACE); p32(f, 4, 12); p32(f, 8, 9); p32(f, 12, 2); // ARMv7 MH_EXECUTE
+  p32(f, 16, 5); p32(f, 20, static_cast<uint32_t>(lc.size())); p32(f, 24, 0);
+  std::memcpy(f.data() + 28, lc.data(), lc.size());
+  p32(f, 0x200, 0xE3A00007);               // mov r0, #7
+  p32(f, 0x204, 0xE12FFF1E);               // bx lr
+  p32(f, 0x1004, 0x1200);                  // unslid pointer for the rebase opcode
+  const uint8_t rebase[] = {0x11, 0x21, 0x04, 0x51, 0x00}; // data segment +4, one pointer
+  std::memcpy(f.data() + 0x2000, rebase, sizeof rebase);
+  const uint8_t bind[] = {0x11, 0x40, '_', 'm', 'i', 's', 's', 'i', 'n', 'g', '_', 'f', 'n', 0,
+                          0x51, 0x71, 0x00, 0x90, 0x00};
+  std::memcpy(f.data() + 0x2020, bind, sizeof bind);
+  return f;
+}
+
 inline Buf build(const Opts& o = {}) {
   Buf f(0x8180, 0);
   auto c = code();

@@ -44,8 +44,12 @@ void* g_androidNativeWindow = nullptr;
 int g_surfaceWidth = 1280;
 int g_surfaceHeight = 720;
 std::atomic<bool> g_uiLoopShouldExit{false};
+std::atomic<bool> g_uiLoopActive{false};
 std::atomic<int> g_uiLoopExitCode{0};
 std::atomic<uint64_t> g_frameCounter{0};
+std::atomic<int> g_lastGraphicsError{0};
+std::atomic<const char*> g_lastGraphicsStage{nullptr};
+bool g_eglWindowSurface = false;
 
 // --- Touch event queue: Android MotionEvent -> iOS UITouch forwarding ----------------------
 // iOS UITouch carries phase (0=began, 1=moved, 2=ended/cancelled), a view-relative location in
@@ -99,6 +103,8 @@ struct NativeGles {
   using EglMakeCurrentFn = int (*)(void*, void*, void*, void*);
   using EglSwapBuffersFn = int (*)(void*, void*);
   using EglGetCurrentContextFn = void* (*)();
+  using EglGetConfigAttribFn = int (*)(void*, void*, int, int*);
+  using EglGetErrorFn = int (*)();
 
   EglGetDisplayFn eglGetDisplay = nullptr;
   EglInitFn eglInitialize = nullptr;
@@ -110,6 +116,8 @@ struct NativeGles {
   EglMakeCurrentFn eglMakeCurrent = nullptr;
   EglSwapBuffersFn eglSwapBuffers = nullptr;
   EglGetCurrentContextFn eglGetCurrentContext = nullptr;
+  EglGetConfigAttribFn eglGetConfigAttrib = nullptr;
+  EglGetErrorFn eglGetError = nullptr;
 
   NativeGles() {
     for (const char* name : {"libEGL.so", "libEGL.so.1"}) {
@@ -136,6 +144,8 @@ struct NativeGles {
     eglMakeCurrent = reinterpret_cast<EglMakeCurrentFn>(symEgl("eglMakeCurrent"));
     eglSwapBuffers = reinterpret_cast<EglSwapBuffersFn>(symEgl("eglSwapBuffers"));
     eglGetCurrentContext = reinterpret_cast<EglGetCurrentContextFn>(symEgl("eglGetCurrentContext"));
+    eglGetConfigAttrib = reinterpret_cast<EglGetConfigAttribFn>(symEgl("eglGetConfigAttrib"));
+    eglGetError = reinterpret_cast<EglGetErrorFn>(symEgl("eglGetError"));
   }
 
   void* resolveGl(const char* name) const {
@@ -155,16 +165,57 @@ NativeGles& nativeGles() {
   return n;
 }
 
+void reportGraphicsIssue(const char* stage, int error) {
+  g_lastGraphicsStage.store(stage, std::memory_order_relaxed);
+  g_lastGraphicsError.store(error, std::memory_order_relaxed);
+  char message[192];
+  std::snprintf(message, sizeof message, "graphics setup issue at %s (code 0x%x)",
+                stage ? stage : "unknown stage", static_cast<unsigned int>(error));
+  logRunEvent(message);
+}
+
+void reportEglFailure(const char* stage) {
+  NativeGles& ng = nativeGles();
+  reportGraphicsIssue(stage, ng.eglGetError ? ng.eglGetError() : 0);
+}
+
+bool configureNativeWindowForEgl(void* display, void* window, void* config) {
+#ifdef __ANDROID__
+  if (!window || !config) return false;
+  NativeGles& ng = nativeGles();
+  if (!ng.eglGetConfigAttrib) {
+    reportGraphicsIssue("eglGetConfigAttrib unavailable", 0);
+    return false;
+  }
+  int nativeVisual = 0;
+  if (!ng.eglGetConfigAttrib(display, config, 0x302E /* EGL_NATIVE_VISUAL_ID */, &nativeVisual)) {
+    reportEglFailure("eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID)");
+    return false;
+  }
+  int status = ANativeWindow_setBuffersGeometry(static_cast<ANativeWindow*>(window), 0, 0, nativeVisual);
+  if (status != 0) reportGraphicsIssue("ANativeWindow_setBuffersGeometry", status);
+  return status == 0;
+#else
+  (void)display;
+  (void)window;
+  (void)config;
+  return true;
+#endif
+}
+
 void* g_eglConfig = nullptr;  // chosen EGLConfig for surface (re)creation
 
 void ensureEglContextInitialized(DummyEAGLContext* ctx) {
   if (!ctx || ctx->eglContext != 0) return;
   NativeGles& ng = nativeGles();
-  if (!ng.eglGetDisplay || !ng.eglInitialize || !ng.eglChooseConfig || !ng.eglCreateContext) return;
+  if (!ng.eglGetDisplay || !ng.eglInitialize || !ng.eglChooseConfig || !ng.eglCreateContext) {
+    reportGraphicsIssue("required EGL entry point unavailable", 0);
+    return;
+  }
   void* dpy = ng.eglGetDisplay(nullptr);  // EGL_DEFAULT_DISPLAY
-  if (!dpy) return;
+  if (!dpy) { reportEglFailure("eglGetDisplay"); return; }
   int major = 0, minor = 0;
-  if (!ng.eglInitialize(dpy, &major, &minor)) return;
+  if (!ng.eglInitialize(dpy, &major, &minor)) { reportEglFailure("eglInitialize"); return; }
   if (ng.eglBindAPI) ng.eglBindAPI(0x30A0);  // EGL_OPENGL_ES_API
   // EGL_RENDERABLE_TYPE=EGL_OPENGL_ES2_BIT(4), EGL_SURFACE_TYPE=EGL_PBUFFER_BIT|EGL_WINDOW_BIT(5),
   // EGL_RED_SIZE=8, EGL_GREEN_SIZE=8, EGL_BLUE_SIZE=8, EGL_DEPTH_SIZE=16, EGL_NONE(0x3038)
@@ -179,22 +230,32 @@ void ensureEglContextInitialized(DummyEAGLContext* ctx) {
   };
   void* cfg = nullptr;
   int numCfg = 0;
-  if (!ng.eglChooseConfig(dpy, configAttribs, &cfg, 1, &numCfg) || numCfg < 1) return;
+  if (!ng.eglChooseConfig(dpy, configAttribs, &cfg, 1, &numCfg) || numCfg < 1) {
+    reportEglFailure("eglChooseConfig");
+    return;
+  }
   // EGL_CONTEXT_CLIENT_VERSION (0x3098), 2, EGL_NONE (0x3038)
   const int ctxAttribs[] = {0x3098, 2, 0x3038};
   void* eglCtx = ng.eglCreateContext(dpy, cfg, nullptr, ctxAttribs);
-  if (!eglCtx) return;
+  if (!eglCtx) { reportEglFailure("eglCreateContext(OpenGL ES 2)"); return; }
   void* surf = nullptr;
-  // We cannot create a window surface here without ANativeWindow in hand for non-Android
-  // builds; bindAndroidEglWindow/updateAndroidEglWindow will attach one on the device.
+  g_eglWindowSurface = false;
+  // Match the ANativeWindow buffer format to the selected EGLConfig before creating a window
+  // surface. Without this, some Android devices reject the surface and silently fall back to a
+  // pbuffer, which makes every successful swap invisible to the user.
   if (g_androidNativeWindow && ng.eglCreateWindowSurface) {
+    configureNativeWindowForEgl(dpy, g_androidNativeWindow, cfg);
     const int winAttribs[] = {0x3038};
     surf = ng.eglCreateWindowSurface(dpy, cfg, g_androidNativeWindow, winAttribs);
+    if (surf) g_eglWindowSurface = true;
+    else reportEglFailure("eglCreateWindowSurface");
   }
   if (!surf && ng.eglCreatePbufferSurface) {
     // EGL_WIDTH, g_surfaceWidth, EGL_HEIGHT, g_surfaceHeight, EGL_NONE
     const int pbufAttribs[] = {0x3057, g_surfaceWidth, 0x3056, g_surfaceHeight, 0x3038};
     surf = ng.eglCreatePbufferSurface(dpy, cfg, pbufAttribs);
+    if (!surf) reportEglFailure("eglCreatePbufferSurface");
+    else if (g_androidNativeWindow) logRunEvent("EGL using a pbuffer fallback; frames will not be visible on the Android Surface");
   }
   ctx->eglDisplay = reinterpret_cast<uint64_t>(dpy);
   ctx->eglSurface = reinterpret_cast<uint64_t>(surf);
@@ -261,13 +322,19 @@ int eaglSetCurrentContext(void* ctxPtr) {
   if (ctx->sharegroup == 0) ctx->sharegroup = reinterpret_cast<uint64_t>(&g_dummyEAGLSharegroup.classStub);
   ensureEglContextInitialized(ctx);
   NativeGles& ng = nativeGles();
-  if (ng.eglMakeCurrent && ctx->eglDisplay && ctx->eglContext) {
+  bool madeCurrent = false;
+  if (ng.eglMakeCurrent && ctx->eglDisplay && ctx->eglContext && ctx->eglSurface) {
     void* surf = reinterpret_cast<void*>(ctx->eglSurface);
-    ng.eglMakeCurrent(reinterpret_cast<void*>(ctx->eglDisplay), surf, surf,
-                      reinterpret_cast<void*>(ctx->eglContext));
+    madeCurrent = ng.eglMakeCurrent(reinterpret_cast<void*>(ctx->eglDisplay), surf, surf,
+                                    reinterpret_cast<void*>(ctx->eglContext)) != 0;
+    if (!madeCurrent) reportEglFailure("eglMakeCurrent");
+  } else {
+    reportGraphicsIssue("EGL context/surface unavailable when setting current", 0);
   }
-  ctx->isCurrent = 1;
+  ctx->isCurrent = madeCurrent ? 1u : 0u;
   g_currentEAGLContext = ctx;
+  // Preserve the old compatibility behavior (UIKit reports success) while the run log and
+  // live diagnostics expose whether a real Android EGL context was actually made current.
   return 1;
 }
 
@@ -280,10 +347,18 @@ int eaglPresentRenderbuffer(void* self, uint32_t /*target*/) {
   noteCompatCall("EAGLContext::presentRenderbuffer");
   std::lock_guard<std::mutex> lock(g_bridgeMutex);
   DummyEAGLContext* ctx = (self == &g_dummyEAGLContext) ? static_cast<DummyEAGLContext*>(self) : &g_dummyEAGLContext;
-  ++ctx->presentedFrames;
   NativeGles& ng = nativeGles();
-  if (ng.eglSwapBuffers && ctx->eglDisplay && ctx->eglSurface) {
-    ng.eglSwapBuffers(reinterpret_cast<void*>(ctx->eglDisplay), reinterpret_cast<void*>(ctx->eglSurface));
+  if (!ng.eglSwapBuffers || !ctx->eglDisplay || !ctx->eglSurface) {
+    static std::atomic<uint64_t> missingSurfaceWarnings{0};
+    uint64_t count = missingSurfaceWarnings.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count == 1 || count % 300 == 0)
+      reportGraphicsIssue("presentRenderbuffer has no EGL surface", 0);
+  } else if (!ng.eglSwapBuffers(reinterpret_cast<void*>(ctx->eglDisplay), reinterpret_cast<void*>(ctx->eglSurface))) {
+    static std::atomic<uint64_t> swapFailures{0};
+    uint64_t count = swapFailures.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count == 1 || count % 300 == 0) reportEglFailure("eglSwapBuffers");
+  } else {
+    ++ctx->presentedFrames;
   }
   return 1;
 }
@@ -321,48 +396,93 @@ void recreateEglSurfaceLocked() {
     g_dummyEAGLContext.eglSurface = 0;
   }
   void* surf = nullptr;
+  g_eglWindowSurface = false;
   if (g_androidNativeWindow && ng.eglCreateWindowSurface) {
+    configureNativeWindowForEgl(dpy, g_androidNativeWindow, g_eglConfig);
     const int winAttribs[] = {0x3038};
     surf = ng.eglCreateWindowSurface(dpy, g_eglConfig, g_androidNativeWindow, winAttribs);
+    if (surf) g_eglWindowSurface = true;
+    else reportEglFailure("eglCreateWindowSurface (rebind)");
   }
   if (!surf && ng.eglCreatePbufferSurface) {
     const int pbufAttribs[] = {0x3057, g_surfaceWidth, 0x3056, g_surfaceHeight, 0x3038};
     surf = ng.eglCreatePbufferSurface(dpy, g_eglConfig, pbufAttribs);
+    if (!surf) reportEglFailure("eglCreatePbufferSurface (rebind)");
+    else if (g_androidNativeWindow) logRunEvent("EGL surface rebind fell back to a pbuffer; game frames will not reach the screen");
   }
   g_dummyEAGLContext.eglSurface = reinterpret_cast<uint64_t>(surf);
-  if (g_dummyEAGLContext.isCurrent && surf && ng.eglMakeCurrent) {
-    ng.eglMakeCurrent(dpy, surf, surf, reinterpret_cast<void*>(g_dummyEAGLContext.eglContext));
+  if (g_dummyEAGLContext.isCurrent && surf && ng.eglMakeCurrent &&
+      !ng.eglMakeCurrent(dpy, surf, surf, reinterpret_cast<void*>(g_dummyEAGLContext.eglContext))) {
+    reportEglFailure("eglMakeCurrent (surface rebind)");
   }
 }
 
 void bindAndroidEglWindow(void* nativeWindow, int width, int height) {
   std::lock_guard<std::mutex> lock(g_bridgeMutex);
-  g_androidNativeWindow = nativeWindow;
+  void* previous = g_androidNativeWindow;
+  const bool sameWindow = previous == nativeWindow;
+  if (!sameWindow) g_androidNativeWindow = nativeWindow;
   if (width > 0) g_surfaceWidth = width;
   if (height > 0) g_surfaceHeight = height;
   g_dummyUIWindow.width = static_cast<uint32_t>(g_surfaceWidth);
   g_dummyUIWindow.height = static_cast<uint32_t>(g_surfaceHeight);
   // Ensure EGL context exists and attach a window surface to it.
   ensureEglContextInitialized(&g_dummyEAGLContext);
-  if (g_dummyEAGLContext.eglDisplay) {
-    recreateEglSurfaceLocked();
-  }
+  if (g_dummyEAGLContext.eglDisplay) recreateEglSurfaceLocked();
+#ifdef __ANDROID__
+  // ANativeWindow_fromSurface returns an acquired reference. The bridge owns the current one;
+  // release the redundant incoming reference for the same window, or the replaced window after
+  // its EGLSurface has been destroyed.
+  if (sameWindow && nativeWindow) ANativeWindow_release(static_cast<ANativeWindow*>(nativeWindow));
+  else if (previous) ANativeWindow_release(static_cast<ANativeWindow*>(previous));
+#endif
+  logRunEvent(std::string("Android Surface bound: ") + std::to_string(g_surfaceWidth) + "x" +
+              std::to_string(g_surfaceHeight) + (g_eglWindowSurface ? " (EGL window surface)" : " (no EGL window surface)"));
 }
 
 void updateAndroidEglWindow(void* nativeWindow, int width, int height) {
   std::lock_guard<std::mutex> lock(g_bridgeMutex);
-  g_androidNativeWindow = nativeWindow;
+  void* previous = g_androidNativeWindow;
+  const bool sameWindow = previous == nativeWindow;
+  if (!sameWindow) g_androidNativeWindow = nativeWindow;
   if (width > 0) g_surfaceWidth = width;
   if (height > 0) g_surfaceHeight = height;
   g_dummyUIWindow.width = static_cast<uint32_t>(g_surfaceWidth);
   g_dummyUIWindow.height = static_cast<uint32_t>(g_surfaceHeight);
   if (g_dummyEAGLContext.eglDisplay) recreateEglSurfaceLocked();
+#ifdef __ANDROID__
+  if (sameWindow && nativeWindow) ANativeWindow_release(static_cast<ANativeWindow*>(nativeWindow));
+  else if (previous) ANativeWindow_release(static_cast<ANativeWindow*>(previous));
+#endif
+  logRunEvent(std::string("Android Surface changed: ") + std::to_string(g_surfaceWidth) + "x" +
+              std::to_string(g_surfaceHeight) + (g_eglWindowSurface ? " (EGL window surface)" : " (no EGL window surface)"));
 }
 
 void eglDrawableSize(int* outWidth, int* outHeight) {
   std::lock_guard<std::mutex> lock(g_bridgeMutex);
   if (outWidth) *outWidth = g_surfaceWidth;
   if (outHeight) *outHeight = g_surfaceHeight;
+}
+
+GraphicsStatus currentGraphicsStatus() {
+  std::lock_guard<std::mutex> lock(g_bridgeMutex);
+  GraphicsStatus status;
+  status.eventLoopActive = g_uiLoopActive.load(std::memory_order_acquire);
+  status.nativeWindowBound = g_androidNativeWindow != nullptr;
+  status.eglReady = g_dummyEAGLContext.eglDisplay && g_dummyEAGLContext.eglContext && g_dummyEAGLContext.eglSurface;
+  status.windowSurface = g_eglWindowSurface;
+  status.contextCurrent = g_dummyEAGLContext.isCurrent != 0;
+  status.displayLinkRegistered = g_dummyCADisplayLink.registeredInRunLoop != 0;
+  status.width = g_surfaceWidth;
+  status.height = g_surfaceHeight;
+  status.uiFrames = g_frameCounter.load(std::memory_order_relaxed);
+  status.presentedFrames = g_dummyEAGLContext.presentedFrames;
+  const char* stage = g_lastGraphicsStage.load(std::memory_order_relaxed);
+  const int error = g_lastGraphicsError.load(std::memory_order_relaxed);
+  if (stage) status.lastEglIssue = std::string(stage) + " (0x" + [] (int value) {
+    char hex[16]; std::snprintf(hex, sizeof hex, "%x", static_cast<unsigned int>(value)); return std::string(hex);
+  }(error) + ")";
+  return status;
 }
 
 void requestExitUiLoop(int exitCode) {
@@ -689,6 +809,21 @@ int uiApplicationMainShim(int argc, char** argv, const void* principal, const vo
   g_dummyUIApplication.applicationState = 0;  // UIApplicationStateActive
   g_uiLoopShouldExit.store(false, std::memory_order_release);
   g_uiLoopExitCode.store(0, std::memory_order_relaxed);
+  g_frameCounter.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(g_bridgeMutex);
+    g_dummyEAGLContext.presentedFrames = 0;
+  }
+  g_uiLoopActive.store(true, std::memory_order_release);
+  {
+    GraphicsStatus status = currentGraphicsStatus();
+    logRunEvent(std::string("UIApplicationMain entered: Surface=") +
+        (status.nativeWindowBound ? "attached" : "missing") + ", EGL=" +
+        (status.eglReady ? "ready" : "not ready") + ", EGL window surface=" +
+        (status.windowSurface ? "yes" : "no") + ", display link=" +
+        (status.displayLinkRegistered ? "registered" : "not registered") + ", size=" +
+        std::to_string(status.width) + "x" + std::to_string(status.height));
+  }
 
   // Target ~60fps loop. Each iteration:
   //   1. Drain any pending Android MotionEvents.
@@ -730,6 +865,16 @@ int uiApplicationMainShim(int argc, char** argv, const void* principal, const vo
     // rendered something on its own. Otherwise presentRenderbuffer already calls eglSwapBuffers.
     ++frames;
     g_frameCounter.store(frames, std::memory_order_relaxed);
+    if (realtimeLoggingEnabled() && frames % 300 == 0) {
+      GraphicsStatus status = currentGraphicsStatus();
+      std::string heartbeat = "UIApplicationMain heartbeat: loopFrames=" + std::to_string(frames) +
+          ", successfulSwaps=" + std::to_string(status.presentedFrames) +
+          ", displayLink=" + (status.displayLinkRegistered ? "registered" : "missing") +
+          ", EGLwindow=" + (status.windowSurface ? "yes" : "no") +
+          ", contextCurrent=" + (status.contextCurrent ? "yes" : "no");
+      if (!status.lastEglIssue.empty()) heartbeat += ", lastGraphicsIssue=" + status.lastEglIssue;
+      logRunEvent(heartbeat);
+    }
 
     nextFrame += frameDuration;
     auto now = Clock::now();
@@ -740,6 +885,10 @@ int uiApplicationMainShim(int argc, char** argv, const void* principal, const vo
       nextFrame = now;
     }
   }
+  g_uiLoopActive.store(false, std::memory_order_release);
+  GraphicsStatus finalStatus = currentGraphicsStatus();
+  logRunEvent("UIApplicationMain exited after " + std::to_string(frames) +
+      " loop frames and " + std::to_string(finalStatus.presentedFrames) + " successful EGL swaps");
   appendGuestOutput("[radeki] UIApplicationMain: event loop exiting\n");
   return g_uiLoopExitCode.load(std::memory_order_relaxed);
 }

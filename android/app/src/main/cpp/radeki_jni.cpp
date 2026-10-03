@@ -29,7 +29,7 @@ static std::string run(const std::string& path) {
     if (!f) throw FormatError("cannot open extracted executable");
     std::vector<uint8_t> file{std::istreambuf_iterator<char>(f), {}};
     auto slices = macho::listSlices(file);
-    auto ch = macho::chooseSlice(slices);
+    auto ch = macho::chooseSliceForHost(slices);
     if (!ch.index) throw FormatError(ch.reason);
     auto img = macho::parseSlice(file, slices[*ch.index]);
     auto rep = analysis::analyze(img);
@@ -49,6 +49,9 @@ static std::string run(const std::string& path) {
     }
     detected.arm64e=img.arch==macho::Arch::ARM64e;
     detected.armv7=img.arch==macho::Arch::ARMv7;
+#if defined(__arm__) && !defined(__aarch64__)
+    detected.hostArm32=true;
+#endif
     detected.encrypted=img.cryptId!=0;
     if(detected.encrypted)detected.blockedReason="encrypted executable";
     size_t totalImports=img.imports.size();
@@ -83,6 +86,32 @@ static std::string run(const std::string& path) {
   return j.str();
 }
 
+extern "C" JNIEXPORT void JNICALL Java_org_radekiosnative_recompiler_Native_beginRunLog(
+    JNIEnv* env, jclass, jstring path, jboolean realtimeLogging) {
+  const char* p = path ? env->GetStringUTFChars(path, nullptr) : nullptr;
+  runtime::beginRunLog(p ? p : "", realtimeLogging == JNI_TRUE);
+  runtime::logRunEvent("run session initialized before Android Surface binding");
+  if (p) env->ReleaseStringUTFChars(path, p);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_radekiosnative_recompiler_Native_endRunLog(JNIEnv*, jclass) {
+  runtime::logRunEvent("native run logger closing");
+  runtime::endRunLog();
+}
+
+extern "C" JNIEXPORT jstring JNICALL Java_org_radekiosnative_recompiler_Native_liveGraphicsStatus(
+    JNIEnv* env, jclass) {
+  const auto s = runtime::currentGraphicsStatus();
+  JsonWriter j;
+  j.beginObject().kvb("eventLoopActive", s.eventLoopActive).kvb("nativeWindowBound", s.nativeWindowBound)
+    .kvb("eglReady", s.eglReady).kvb("windowSurface", s.windowSurface)
+    .kvb("contextCurrent", s.contextCurrent).kvb("displayLinkRegistered", s.displayLinkRegistered)
+    .key("width").num(s.width).key("height").num(s.height)
+    .kvu("uiFrames", s.uiFrames).kvu("successfulSwaps", s.presentedFrames)
+    .kv("lastGraphicsIssue", s.lastEglIssue).endObject();
+  return env->NewStringUTF(j.str().c_str());
+}
+
 extern "C" JNIEXPORT jstring JNICALL Java_org_radekiosnative_recompiler_Native_analyze(JNIEnv* env, jclass, jstring path) {
   const char* p = env->GetStringUTFChars(path, nullptr);
   std::string r = run(p);
@@ -98,32 +127,49 @@ static std::string resultJson(const runtime::RunResult& r) {
     .kv("trapClass",r.trapClass).kv("subsystem",r.subsystem).kv("resolutionMethod",r.resolutionMethod)
     .kvh("callAddress",r.callAddress).kv("callSymbol",r.callSymbol).kv("image",r.image)
     .key("threadId").num(r.threadId).kvu("dispatchStubs", r.dispatchStubs);
-  j.key("recentCalls").beginArray();for(const auto& c:r.recentCalls)j.str(c);j.endArray();j.endObject();
+  j.key("recentCalls").beginArray();for(const auto& c:r.recentCalls)j.str(c);j.endArray();
+  const auto graphics = runtime::currentGraphicsStatus();
+  j.key("graphics").beginObject().kvb("eventLoopActive", graphics.eventLoopActive)
+    .kvb("nativeWindowBound", graphics.nativeWindowBound).kvb("eglReady", graphics.eglReady)
+    .kvb("windowSurface", graphics.windowSurface).kvb("contextCurrent", graphics.contextCurrent)
+    .kvb("displayLinkRegistered", graphics.displayLinkRegistered).key("width").num(graphics.width)
+    .key("height").num(graphics.height).kvu("uiFrames", graphics.uiFrames)
+    .kvu("successfulSwaps", graphics.presentedFrames).kv("lastGraphicsIssue", graphics.lastEglIssue).endObject();
+  j.endObject();
   return j.str();
 }
 
 extern "C" JNIEXPORT jstring JNICALL Java_org_radekiosnative_recompiler_Native_run(
     JNIEnv* env, jclass, jstring path, jboolean compatibilityFallbacks, jboolean traceMissingApis) {
-  const char* p = env->GetStringUTFChars(path, nullptr);
+  const char* p = path ? env->GetStringUTFChars(path, nullptr) : nullptr;
   runtime::RunResult r;
   try {
+    runtime::logRunEvent(std::string("native run requested for ") + (p ? p : "<null path>"));
     runtime::ensureSandboxDirectories();
+    if (!p) throw FormatError("missing executable path");
     std::ifstream f(p, std::ios::binary);
     if (!f) throw FormatError("cannot open extracted executable");
     std::vector<uint8_t> file{std::istreambuf_iterator<char>(f), {}};
     auto slices = macho::listSlices(file);
-    auto ch = macho::chooseSlice(slices);
+    auto ch = macho::chooseSliceForHost(slices);
     if (!ch.index) throw FormatError(ch.reason);
     auto img = macho::parseSlice(file, slices[*ch.index]);
-    // Compatibility mode enables the host shims and unresolved-import dispatch stubs. Keep
-    // logging independently configurable so users can reduce overhead without changing behavior.
-    runtime::setStubCallLogging(traceMissingApis == JNI_TRUE);
+    runtime::logRunEvent(std::string("Mach-O selected: ") + macho::archName(img.arch) +
+        ", imports=" + std::to_string(img.imports.size()) + ", segments=" + std::to_string(img.segments.size()));
+    // Compatibility mode enables the host shims and unresolved-import dispatch stubs. RTLS also
+    // enables their sampled first-call log entries, without changing stub return behavior.
+    runtime::setStubCallLogging(traceMissingApis == JNI_TRUE || runtime::realtimeLoggingEnabled());
+    runtime::logRunEvent(std::string("guest launch options: compatibility fallbacks=") +
+        (compatibilityFallbacks == JNI_TRUE ? "on" : "off") +
+        ", missing API trace=" + (traceMissingApis == JNI_TRUE ? "on" : "off"));
     r = runtime::runImage(img, compatibilityFallbacks == JNI_TRUE);
     r.image = p;
+    runtime::logRunEvent("guest execution result: " + runtime::describeResult(r));
   } catch (const std::exception& e) {
     r.error = e.what();
+    runtime::logRunEvent(std::string("native run error: ") + e.what());
   }
-  env->ReleaseStringUTFChars(path, p);
+  if (p) env->ReleaseStringUTFChars(path, p);
   return env->NewStringUTF(resultJson(r).c_str());
 }
 
@@ -131,12 +177,20 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_radekiosnative_recompiler_Native_r
 extern "C" JNIEXPORT jstring JNICALL Java_org_radekiosnative_recompiler_Native_selfTest(JNIEnv* env, jclass) {
   runtime::RunResult r;
   try {
+    runtime::logRunEvent("starting built-in native self-test");
+#if defined(__arm__) && !defined(__aarch64__)
+    auto bytes = synth::buildArm32Test();
+#else
     auto bytes = synth::build({});
+#endif
     auto img = macho::parseFile(bytes);
+    runtime::setStubCallLogging(runtime::realtimeLoggingEnabled());
     r = runtime::runImage(img);
     r.image = "synthetic self-test";
+    runtime::logRunEvent("self-test result: " + runtime::describeResult(r));
   } catch (const std::exception& e) {
     r.error = e.what();
+    runtime::logRunEvent(std::string("self-test error: ") + e.what());
   }
   return env->NewStringUTF(resultJson(r).c_str());
 }
@@ -171,11 +225,17 @@ extern "C" JNIEXPORT void JNICALL Java_org_radekiosnative_recompiler_Native_bind
     return;
   }
   ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+  if (!window) {
+    runtime::logRunEvent("ANativeWindow_fromSurface failed for the launch Surface");
+    runtime::updateAndroidEglWindow(nullptr, width, height);
+    return;
+  }
   if (width <= 0 || height <= 0) {
     width = ANativeWindow_getWidth(window);
     height = ANativeWindow_getHeight(window);
   }
-  radeki::runtime::bindAndroidEglWindow(window, width, height);
+  runtime::logRunEvent(std::string("Native Android Surface received: ") + std::to_string(width) + "x" + std::to_string(height));
+  runtime::bindAndroidEglWindow(window, width, height);
 #else
   (void)env; (void)surface; (void)width; (void)height;
 #endif
@@ -189,11 +249,16 @@ extern "C" JNIEXPORT void JNICALL Java_org_radekiosnative_recompiler_Native_surf
     return;
   }
   ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+  if (!window) {
+    runtime::logRunEvent("ANativeWindow_fromSurface failed while resizing the Surface");
+    runtime::updateAndroidEglWindow(nullptr, 0, 0);
+    return;
+  }
   if (width <= 0 || height <= 0) {
     width = ANativeWindow_getWidth(window);
     height = ANativeWindow_getHeight(window);
   }
-  radeki::runtime::updateAndroidEglWindow(window, width, height);
+  runtime::updateAndroidEglWindow(window, width, height);
 #else
   (void)env; (void)surface; (void)width; (void)height;
 #endif
@@ -201,8 +266,9 @@ extern "C" JNIEXPORT void JNICALL Java_org_radekiosnative_recompiler_Native_surf
 
 extern "C" JNIEXPORT void JNICALL Java_org_radekiosnative_recompiler_Native_surfaceDestroyed(
     JNIEnv*, jclass) {
-  radeki::runtime::updateAndroidEglWindow(nullptr, 0, 0);
-  radeki::runtime::requestExitUiLoop(0);
+  runtime::logRunEvent("Android Surface destroyed; requesting guest event-loop exit");
+  runtime::updateAndroidEglWindow(nullptr, 0, 0);
+  runtime::requestExitUiLoop(0);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_org_radekiosnative_recompiler_Native_touchEvent(

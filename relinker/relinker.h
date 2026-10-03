@@ -1,5 +1,7 @@
-// Native ARM64 relinker: slides a Mach-O image to a new base, applies rebases/binds, resolves
-// imports against a compatibility registry, and never fakes success for unresolved imports.
+// Native ARM64/ARMv7 relinker: slides a Mach-O image to a matching page-aligned base, applies
+// pointer rebases/binds, resolves imports against a compatibility registry, and never fakes
+// success for unresolved imports. AArch32 branch rewriting and instruction validation remain
+// unsupported and are reported honestly.
 #pragma once
 #include <functional>
 #include <map>
@@ -15,7 +17,20 @@ namespace radeki::relinker {
 
 struct LinkError : std::runtime_error { using std::runtime_error::runtime_error; };
 
-constexpr uint64_t kPageSize = 0x4000;  // iOS 16K page; keeps ADRP page deltas valid
+constexpr uint64_t kPageSize = 0x4000;  // arm64 iOS 16K page; keeps ADRP page deltas valid
+constexpr uint64_t kArm32PageSize = 0x1000;
+#if defined(__arm__) && !defined(__aarch64__)
+constexpr uint64_t kDefaultLoadBase = 0x10000000;
+#else
+constexpr uint64_t kDefaultLoadBase = 0x200000000ull;
+#endif
+constexpr bool isArm32Architecture(macho::Arch arch) {
+  return arch == macho::Arch::ARMv6 || arch == macho::Arch::ARMv7 ||
+         arch == macho::Arch::ARMv7s || arch == macho::Arch::ARMv7k;
+}
+constexpr uint64_t pageSizeForArch(macho::Arch arch) {
+  return isArm32Architecture(arch) ? kArm32PageSize : kPageSize;
+}
 
 struct ImportResolver {
   virtual ~ImportResolver() = default;
@@ -53,7 +68,7 @@ class CompatRegistry : public ImportResolver {
 };
 
 struct LinkOptions {
-  uint64_t loadBase = 0x200000000ull;        // must be 16K aligned
+  uint64_t loadBase = kDefaultLoadBase;      // 16K aligned for ARM64, 4K for ARMv7
   const ImportResolver* resolver = nullptr;  // null => everything unresolved
   uint32_t veneerSlots = 64;
   uint64_t maxImageBytes = 1ull << 30;
@@ -67,6 +82,7 @@ struct BoundImport { std::string symbol, dylib; uint64_t slot; bool resolved, we
 struct Trap { uint32_t index; uint64_t addr; std::string symbol; };
 
 struct LinkedImage {
+  macho::Arch arch = macho::Arch::Unknown;
   uint64_t loadBase = 0, imageBase = 0, slide = 0, imageSize = 0, totalSize = 0;
   std::optional<uint64_t> entry;
   std::vector<uint8_t> memory;   // contiguous: image, then stub/veneer region

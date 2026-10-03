@@ -103,7 +103,7 @@ static void usage() {
           "  analyze   static report; --objc dumps the Objective-C metadata it found\n"
           "  convert   link and write the relinked image; validate checks every PC-relative reference\n"
           "  load      register <exe> plus every --dylib, link them together and report unresolved imports\n"
-          "  run       the same, then execute them in one address space (needs an ARM64 host)\n"
+          "  run       the same, then execute them in one address space (needs a matching ARM process)\n"
           "  --stubs   link with the host runtime layer: framework shims/dummies + libc++ forwarding, and\n"
           "            bind what remains to logging no-op dispatch stubs instead of BRK traps (opt-in for\n"
           "            load/symbols; run uses it by default, --traps restores honest trap stubs).\n"
@@ -145,7 +145,8 @@ int main(int argc, char** argv) {
     }
     auto file = slurp(argv[2]);
     auto slices = macho::listSlices(file);
-    auto choice = macho::chooseSlice(slices);
+    const bool nativeLoadCommand = cmd == "load" || cmd == "run";
+    auto choice = nativeLoadCommand ? macho::chooseSliceForHost(slices) : macho::chooseSlice(slices);
     if (!choice.index) throw FormatError(choice.reason);
     auto img = macho::parseSlice(file, slices[*choice.index]);
     auto rep = analysis::analyze(img);
@@ -160,7 +161,11 @@ int main(int argc, char** argv) {
         if(f.find("CoreFoundation")!=std::string::npos)d.corefoundation=true;
         if(f.find("Vulkan")!=std::string::npos)d.vulkan=true;
       }d.arm64e=img.arch==macho::Arch::ARM64e;
-      d.armv7=img.arch==macho::Arch::ARMv7;d.encrypted=img.cryptId!=0;
+      d.armv7=img.arch==macho::Arch::ARMv7;
+#if defined(__arm__) && !defined(__aarch64__)
+      d.hostArm32=true;
+#endif
+      d.encrypted=img.cryptId!=0;
       if(d.encrypted)d.blockedReason="encrypted executable";
       // Analyze does not imply linking; state remains ANALYZED until an actual link succeeds.
       j.kv("state",compat::runtimeStateName(compat::stateFor(d))).kv("summary",compat::summaryFor(d,img.imports.size()));
@@ -193,7 +198,7 @@ int main(int argc, char** argv) {
       for (const auto& p : dylibPaths) {
         bufs.push_back(slurp(p.c_str()));
         auto sl = macho::listSlices(bufs.back());
-        auto ch = macho::chooseSlice(sl);
+        auto ch = nativeLoadCommand ? macho::chooseSliceForHost(sl) : macho::chooseSlice(sl);
         if (!ch.index) throw FormatError(p + ": " + ch.reason);
         imgs.push_back(macho::parseSlice(bufs.back(), sl[*ch.index]));
         if (reg.add({p, &imgs.back(), false}) < 0) throw FormatError(p + ": could not be registered (duplicate path?)");

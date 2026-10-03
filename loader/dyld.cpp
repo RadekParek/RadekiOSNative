@@ -148,8 +148,21 @@ std::optional<compat::CompatEntry> Registry::describe(const std::string& symbol,
 LoadResult Registry::linkAll(const Options& opt) {
   LoadResult res;
   opt_ = &opt;
-  if (opt.firstBase % relinker::kPageSize || opt.spacing == 0 || opt.spacing % relinker::kPageSize) {
-    res.errors.push_back("loader options: firstBase and spacing must be non-zero and 16K aligned");
+  uint64_t pageSize = relinker::kPageSize;
+  std::optional<bool> pointerWidth64;
+  for (const auto& entry : entries_) {
+    if (!entry.image) continue;
+    const uint64_t imagePageSize = relinker::pageSizeForArch(entry.image->arch);
+    if (!pointerWidth64) {
+      pointerWidth64 = entry.image->is64;
+      pageSize = imagePageSize;
+    } else if (entry.image->is64 != *pointerWidth64 || imagePageSize != pageSize) {
+      res.errors.push_back("loader cannot mix 32-bit and 64-bit guest images in one process");
+      return res;
+    }
+  }
+  if (opt.firstBase % pageSize || opt.spacing == 0 || opt.spacing % pageSize) {
+    res.errors.push_back("loader options: firstBase and spacing must be non-zero and aligned to the guest page size");
     return res;
   }
   if (entries_.empty()) {
@@ -269,7 +282,7 @@ LoadResult Registry::linkAll(const Options& opt) {
         if (!e.executable && e.installName.empty())
           res.warnings.push_back(e.path + ": dylib has no LC_ID_DYLIB, so nothing can import from it by name");
       }
-      base += std::max(opt.spacing, alignUp(e.totalSize, relinker::kPageSize));
+      base += std::max(opt.spacing, alignUp(e.totalSize, pageSize));
     }
   };
 

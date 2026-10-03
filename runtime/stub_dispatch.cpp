@@ -26,7 +26,13 @@ constexpr uint32_t kLdrX9Lit16 = 0x58000089;   // LDR x9,  [pc, #16]  -> StubRec
 constexpr uint32_t kLdrX16Lit24 = 0x580000B0;  // LDR x16, [pc, #24]  -> dispatch entry
 constexpr uint32_t kBrX16 = 0xD61F0200;        // BR  x16
 constexpr uint32_t kNop = 0xD503201F;
-constexpr size_t kTrampolineBytes = 32;        // 4 words + two 8-byte literals
+#if defined(__arm__) && !defined(__aarch64__)
+constexpr size_t kTrampolineBytes = 44;        // A32 bridge + two 4-byte literals
+constexpr size_t kRecordLiteralOffset = 36;
+#else
+constexpr size_t kTrampolineBytes = 32;        // 4 A64 words + two 8-byte literals
+constexpr size_t kRecordLiteralOffset = 16;
+#endif
 constexpr size_t kChunkBytes = 64 * 1024;
 
 // objc-class-shaped dummy block for _OBJC_CLASS_$_ / _OBJC_METACLASS_$_ and a labelled zero
@@ -142,8 +148,16 @@ radeki_stub_dispatch_entry:
   ret
 )asm");
 uint64_t stubDispatchEntryAddress() { return reinterpret_cast<uint64_t>(&radeki_stub_dispatch_entry); }
+#elif defined(__arm__)
+// A32 trampoline saves the caller registers, places StubRecord* in r0 and the original r0
+// argument in r1, then BLXes this ordinary AAPCS32 wrapper. Its low-bit Thumb marker (if any)
+// is honored by BLX, allowing the NDK to compile the C++ runtime in Thumb mode.
+extern "C" uint64_t radekiStubDispatchArm32(StubRecord* rec, uintptr_t originalR0) {
+  return radekiStubDispatchC(rec, originalR0);
+}
+uint64_t stubDispatchEntryAddress() { return reinterpret_cast<uintptr_t>(&radekiStubDispatchArm32); }
 #else
-// Non-AArch64 hosts never execute guest code; the trampolines are only inspected by tests.
+// Non-ARM hosts never execute guest code; the trampolines are only inspected by tests.
 // The literal still needs a valid address, so hand it the C dispatcher directly.
 static uint64_t fallbackEntry(StubRecord* rec, uint64_t x0) { return radekiStubDispatchC(rec, x0); }
 uint64_t stubDispatchEntryAddress() { return reinterpret_cast<uint64_t>(&fallbackEntry); }
@@ -219,12 +233,24 @@ uint64_t StubArena::makeCodeStub(const std::string& symbol, const std::string& d
 
   uint8_t* p = im.alloc(kTrampolineBytes);
   if (!p) return 0;
+#if defined(__arm__) && !defined(__aarch64__)
+  // push {r0-r5,r12,lr}; move original r0 to r1; load the record and dispatcher literals;
+  // BLX the dispatcher; save its r0:r1 return pair over the original arguments; restore and BX.
+  const uint32_t words[9] = {0xE92D503F, 0xE1A01000, 0xE59F0014, 0xE59FC014,
+                             0xE12FFF3C, 0xE58D0000, 0xE58D1004, 0xE8BD503F, 0xE12FFF1E};
+  std::memcpy(p, words, sizeof words);
+  uint32_t recAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rec));
+  uint32_t entry = static_cast<uint32_t>(stubDispatchEntryAddress());
+  std::memcpy(p + 36, &recAddr, sizeof recAddr);
+  std::memcpy(p + 40, &entry, sizeof entry);
+#else
   uint32_t words[4] = {kLdrX9Lit16, kLdrX16Lit24, kBrX16, kNop};
   std::memcpy(p, words, sizeof words);
   uint64_t recAddr = reinterpret_cast<uint64_t>(rec);
   uint64_t entry = stubDispatchEntryAddress();
   std::memcpy(p + 16, &recAddr, 8);
   std::memcpy(p + 24, &entry, 8);
+#endif
   for (auto& c : im.chunks) {  // seal the chunk that got the code (no-op for untouched ones)
     uint64_t b = reinterpret_cast<uint64_t>(c.base);
     if (reinterpret_cast<uint64_t>(p) >= b && reinterpret_cast<uint64_t>(p) < b + kChunkBytes) im.seal(c);
@@ -252,8 +278,8 @@ const StubRecord* StubArena::recordForStubAddress(uint64_t addr) const {
   Impl& im = impl();
   std::lock_guard<std::mutex> lock(im.mu);
   if (!im.owns(addr)) return nullptr;
-  uint64_t recAddr = 0;
-  std::memcpy(&recAddr, reinterpret_cast<const void*>(addr + 16), 8);
+  uintptr_t recAddr = 0;
+  std::memcpy(&recAddr, reinterpret_cast<const void*>(addr + kRecordLiteralOffset), sizeof recAddr);
   return reinterpret_cast<const StubRecord*>(recAddr);
 }
 

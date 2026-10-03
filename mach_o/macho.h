@@ -132,7 +132,10 @@ struct SliceChoice {
   std::optional<size_t> index;
   std::string reason;
 };
-// Prefer ARM64e/ARM64 on an ARM64 host, then ARMv7s/ARMv7. Reports precisely why on failure.
+// Architecture-neutral preference used by file inspection and CLI parsing.
 SliceChoice chooseSlice(const std::vector<SliceInfo>& slices);
+// Prefer the architecture executable in this process can natively run (ARMv7 in an AArch32
+// process, ARM64 first elsewhere), while retaining a clear mismatch result for ARM-only files.
+SliceChoice chooseSliceForHost(const std::vector<SliceInfo>& slices);
 
 }  // namespace radeki::macho

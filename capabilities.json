@@ -9,8 +9,13 @@
     "macho_exports_trie": "not_started",
     "macho_weak_bind_coalescing": "not_started",
     "binary_analysis_arm64": "partial",
+    "binary_analysis_armv7": "partial",
     "arm64_native_relink": "tested",
     "arm64_veneers_branch_patch": "tested",
+    "armv7_native_relink": "tested_host",
+    "armv7_pointer_rebases_binds": "tested_host",
+    "armv7_branch_rewriting": "not_started",
+    "armv7_instruction_validation": "not_started",
     "arm64e_pac": "scaffolding",
     "armv7_aot": "not_started",
     "objc_runtime": "not_started",
@@ -27,8 +32,10 @@
     "input": "not_started",
     "networking": "not_started",
     "filesystem": "not_started",
-    "android_packaging": "not_started",
+    "android_packaging": "unverified_android",
+    "arm32_apk_packaging": "unverified_android",
     "native_execution_on_arm64_android": "not_started",
+    "native_execution_on_arm32_android": "not_started",
     "objc_metadata_read": "tested",
     "dyld_image_registry": "tested_host",
     "multi_image_link": "tested_host",
@@ -48,6 +55,9 @@
     "ipa_inflate_png_plist": "tested_host",
     "ipa_bundle_inspection": "tested_host",
     "android_library_import": "unverified_android",
-    "crash_diagnostics": "partial"
+    "crash_diagnostics": "partial",
+    "durable_run_logging": "partial",
+    "realtime_logging_opt_in": "tested_host",
+    "arm32_java_ui": "unverified_android"
   }
 }

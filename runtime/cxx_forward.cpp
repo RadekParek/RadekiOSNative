@@ -1,15 +1,15 @@
 // Explicit libc++ forwarding wrappers. See cxx_forward.h for the doctrine.
 //
-// Every basic_string wrapper below implements the documented libc++ 64-bit storage layout
-// explicitly (24 bytes: short mode holds size<<1 in byte 0 and up to 22 chars inline; long
-// mode holds (capacity<<1)|1 in word 0, size in word 1 and the data pointer in word 2).
+// Every basic_string wrapper below implements the documented libc++ native-word storage layout
+// explicitly (three words: 24 bytes/22 inline chars on ARM64, 12 bytes/10 inline chars on ARMv7;
+// short mode holds size<<1 in byte 0; long mode stores capacity, size, and data pointer).
 // They never reinterpret the host's std::string, because the host may be libstdc++, whose
 // layout differs; on an Android NDK host the layouts agree anyway.
 //
 // CRITICAL ABI REQUIREMENT:
-// In the Itanium/ARM64 C++ ABI used by Apple's libc++.1.dylib, mutating basic_string methods
+// In the Itanium C++ ABI used by Apple's libc++.1.dylib, mutating basic_string methods
 // (insert, append, assign, replace, erase, operator=) return `basic_string&` in x0 (`this`),
-// and constructors/destructors (C1/C2/D1/D2) also return `this` in x0 under ARM64 ABI.
+// and constructors/destructors (C1/C2/D1/D2) leave `this` in the first result register.
 // Returning void (or stubbing to 0) leaves x0 NULL or clobbered, causing callers such as
 // PoolAllocator and static initializers (__GLOBAL__I_*) to fault at [x0, #0x10] (SIGSEGV at
 // faultAddr 0x10) when reading the returned string reference's third word.
@@ -30,11 +30,11 @@
 namespace radeki::runtime {
 namespace {
 
-constexpr size_t kSSOCapacity = 22;  // libc++ char SSO capacity on 64-bit little-endian
+constexpr size_t kSSOCapacity = sizeof(uintptr_t) * 3 - 2;  // 22 bytes on ARM64; 10 on ARMv7
 
 // Apple's ABI, written out. A GuestStdString* is exactly what the guest passes as `this`.
 struct GuestStdString {
-  uint64_t w[3];
+  uintptr_t w[3];
 
   bool isLong() const { return (w[0] & 1) != 0; }
   size_t size() const { return isLong() ? size_t(w[1]) : size_t((w[0] & 0xFF) >> 1); }
@@ -56,9 +56,9 @@ struct GuestStdString {
     if (!buf) return false;  // OOM: caller degrades to empty rather than aborting the host
     if (n && p) std::memcpy(buf, p, n);
     buf[n] = 0;
-    w[0] = (uint64_t(allocCap) << 1) | 1;
+    w[0] = (uintptr_t(allocCap) << 1) | 1;
     w[1] = n;
-    w[2] = reinterpret_cast<uint64_t>(buf);
+    w[2] = reinterpret_cast<uintptr_t>(buf);
     return true;
   }
   void releaseLong() {
@@ -73,7 +73,7 @@ struct GuestStdString {
     }
   }
 };
-static_assert(sizeof(GuestStdString) == 24, "libc++ basic_string<char> is 24 bytes on arm64");
+static_assert(sizeof(GuestStdString) == 3 * sizeof(uintptr_t), "guest libc++ string is three native words");
 
 // Static fallback empty string if a guest caller ever passes a null `this` pointer.
 GuestStdString& fallbackGuestString() {
@@ -114,9 +114,9 @@ void gsFill(GuestStdString* s, size_t n, char c) {
   if (!buf) { s->makeShort("", 0); noteCompatCall("cxx_oom"); return; }
   std::memset(buf, c, n);
   buf[n] = 0;
-  s->w[0] = (uint64_t(allocCap) << 1) | 1;
+  s->w[0] = (uintptr_t(allocCap) << 1) | 1;
   s->w[1] = n;
-  s->w[2] = reinterpret_cast<uint64_t>(buf);
+  s->w[2] = reinterpret_cast<uintptr_t>(buf);
 }
 
 void gsDestroy(GuestStdString* s) {
@@ -173,9 +173,9 @@ void gsSplice(GuestStdString* s, size_t pos, size_t removeLen, const char* p, si
   if (tail) std::memcpy(buf + pos + n, cur + pos + removeLen, tail);
   buf[newSize] = 0;
   s->releaseLong();
-  s->w[0] = (uint64_t(cap) << 1) | 1;
+  s->w[0] = (uintptr_t(cap) << 1) | 1;
   s->w[1] = newSize;
-  s->w[2] = reinterpret_cast<uint64_t>(buf);
+  s->w[2] = reinterpret_cast<uintptr_t>(buf);
 }
 
 void gsReplace(GuestStdString* s, size_t pos, const char* p, size_t n) {
@@ -200,9 +200,9 @@ void gsAssign(GuestStdString* s, const char* p, size_t n) {
   if (n) std::memcpy(buf, p, n);
   buf[n] = 0;
   s->releaseLong();
-  s->w[0] = (uint64_t(cap) << 1) | 1;
+  s->w[0] = (uintptr_t(cap) << 1) | 1;
   s->w[1] = n;
-  s->w[2] = reinterpret_cast<uint64_t>(buf);
+  s->w[2] = reinterpret_cast<uintptr_t>(buf);
 }
 
 // --- wrappers with neutral names; the forwarding table registers them under Apple's ---------
@@ -210,14 +210,14 @@ void gsAssign(GuestStdString* s, const char* p, size_t n) {
 // so register x0 holds a valid, non-null guest string address on return.
 
 // std::__1::basic_string<char>::__init(const char*, size_type)
-GuestStdString* w_init_ptr_len(GuestStdString* s, const char* p, uint64_t n) {
+GuestStdString* w_init_ptr_len(GuestStdString* s, const char* p, size_t n) {
   noteCompatCall("std::string::__init(const char*,size)");
   s = ensureValidString(s);
   gsInit(s, p, size_t(n));
   return s;
 }
 // std::__1::basic_string<char>::__init(const char*, size_type, size_type)
-GuestStdString* w_init_ptr_len_cap(GuestStdString* s, const char* p, uint64_t n, uint64_t cap) {
+GuestStdString* w_init_ptr_len_cap(GuestStdString* s, const char* p, size_t n, size_t cap) {
   noteCompatCall("std::string::__init(const char*,size,cap)");
   s = ensureValidString(s);
   if (!p) { p = ""; n = 0; }
@@ -231,7 +231,7 @@ GuestStdString* w_init_ptr_len_cap(GuestStdString* s, const char* p, uint64_t n,
   return s;
 }
 // std::__1::basic_string<char>::__init(size_type, char)
-GuestStdString* w_init_fill(GuestStdString* s, uint64_t n, char c) {
+GuestStdString* w_init_fill(GuestStdString* s, size_t n, char c) {
   noteCompatCall("std::string::__init(size,char)");
   s = ensureValidString(s);
   gsFill(s, size_t(n), c);
@@ -254,13 +254,13 @@ GuestStdString* w_ctor_cstr(GuestStdString* s, const char* p) {
 GuestStdString* w_ctor_cstr_alloc(GuestStdString* s, const char* p, const void* /*alloc*/) {
   return w_ctor_cstr(s, p);
 }
-GuestStdString* w_ctor_ptr_len(GuestStdString* s, const char* p, uint64_t n) {
+GuestStdString* w_ctor_ptr_len(GuestStdString* s, const char* p, size_t n) {
   noteCompatCall("std::string::ctor(const char*,size)");
   s = ensureValidString(s);
   gsInit(s, p, size_t(n));
   return s;
 }
-GuestStdString* w_ctor_fill(GuestStdString* s, uint64_t n, char c) {
+GuestStdString* w_ctor_fill(GuestStdString* s, size_t n, char c) {
   noteCompatCall("std::string::ctor(size,char)");
   s = ensureValidString(s);
   gsFill(s, size_t(n), c);
@@ -280,7 +280,7 @@ GuestStdString* w_ctor_copy(GuestStdString* s, const GuestStdString* other) {
   return s;
 }
 // substring constructor: basic_string(const basic_string&, size_type pos, size_type n, const allocator&)
-GuestStdString* w_ctor_substr(GuestStdString* s, const GuestStdString* other, uint64_t pos, uint64_t n, const void* /*alloc*/) {
+GuestStdString* w_ctor_substr(GuestStdString* s, const GuestStdString* other, size_t pos, size_t n, const void* /*alloc*/) {
   noteCompatCall("std::string::ctor(const string&,pos,n)");
   s = ensureValidString(s);
   if (!other) { s->makeShort("", 0); return s; }
@@ -324,14 +324,14 @@ GuestStdString* w_assign_char(GuestStdString* s, char c) {
   return s;
 }
 // assign(const char*, size_type)
-GuestStdString* w_assign_ptr_len(GuestStdString* s, const char* p, uint64_t n) {
+GuestStdString* w_assign_ptr_len(GuestStdString* s, const char* p, size_t n) {
   noteCompatCall("std::string::assign(const char*,size)");
   s = ensureValidString(s);
   gsAssign(s, p, size_t(n));
   return s;
 }
 // assign(const basic_string&, size_type, size_type)
-GuestStdString* w_assign_substr(GuestStdString* s, const GuestStdString* other, uint64_t pos, uint64_t n) {
+GuestStdString* w_assign_substr(GuestStdString* s, const GuestStdString* other, size_t pos, size_t n) {
   noteCompatCall("std::string::assign(const string&,pos,n)");
   s = ensureValidString(s);
   if (!other) { gsAssign(s, "", 0); return s; }
@@ -344,7 +344,7 @@ GuestStdString* w_assign_substr(GuestStdString* s, const GuestStdString* other, 
   return s;
 }
 // assign(size_type, char)
-GuestStdString* w_assign_fill(GuestStdString* s, uint64_t n, char c) {
+GuestStdString* w_assign_fill(GuestStdString* s, size_t n, char c) {
   noteCompatCall("std::string::assign(size,char)");
   s = ensureValidString(s);
   if (size_t(n) <= s->capacity()) {
@@ -359,7 +359,7 @@ GuestStdString* w_assign_fill(GuestStdString* s, uint64_t n, char c) {
   return s;
 }
 // append(const char*, size_type)
-GuestStdString* w_append_ptr_len(GuestStdString* s, const char* p, uint64_t n) {
+GuestStdString* w_append_ptr_len(GuestStdString* s, const char* p, size_t n) {
   noteCompatCall("std::string::append(const char*,size)");
   s = ensureValidString(s);
   gsReplace(s, s->size(), p, size_t(n));
@@ -383,7 +383,7 @@ GuestStdString* w_append_str(GuestStdString* s, const GuestStdString* other) {
   return s;
 }
 // append(const basic_string&, size_type, size_type)
-GuestStdString* w_append_substr(GuestStdString* s, const GuestStdString* other, uint64_t pos, uint64_t n) {
+GuestStdString* w_append_substr(GuestStdString* s, const GuestStdString* other, size_t pos, size_t n) {
   noteCompatCall("std::string::append(const string&,pos,n)");
   s = ensureValidString(s);
   if (!other) return s;
@@ -396,7 +396,7 @@ GuestStdString* w_append_substr(GuestStdString* s, const GuestStdString* other, 
   return s;
 }
 // append(size_type, char)
-GuestStdString* w_append_fill(GuestStdString* s, uint64_t n, char c) {
+GuestStdString* w_append_fill(GuestStdString* s, size_t n, char c) {
   noteCompatCall("std::string::append(size,char)");
   s = ensureValidString(s);
   if (n == 0) return s;
@@ -429,7 +429,7 @@ void w_clear(GuestStdString* s) {
 }
 // reserve(size_type): libc++ only grows here; reserve(n) with n <= capacity() is a no-op
 // (it never collapses long storage back to SSO, keeping data() pointers stable).
-void w_reserve(GuestStdString* s, uint64_t n) {
+void w_reserve(GuestStdString* s, size_t n) {
   noteCompatCall("std::string::reserve");
   s = ensureValidString(s);
   if (n <= s->capacity()) return;
@@ -440,12 +440,12 @@ void w_reserve(GuestStdString* s, uint64_t n) {
   std::memcpy(buf, s->data(), sz);
   buf[sz] = 0;
   s->releaseLong();
-  s->w[0] = (uint64_t(cap) << 1) | 1;
+  s->w[0] = (uintptr_t(cap) << 1) | 1;
   s->w[1] = sz;
-  s->w[2] = reinterpret_cast<uint64_t>(buf);
+  s->w[2] = reinterpret_cast<uintptr_t>(buf);
 }
 // resize(size_type, char) and resize(size_type)
-void w_resize_fill(GuestStdString* s, uint64_t n, char c) {
+void w_resize_fill(GuestStdString* s, size_t n, char c) {
   noteCompatCall("std::string::resize");
   s = ensureValidString(s);
   size_t sz = s->size();
@@ -466,10 +466,10 @@ void w_resize_fill(GuestStdString* s, uint64_t n, char c) {
   std::vector<char> fill(extra, c);
   gsReplace(s, sz, fill.data(), extra);
 }
-void w_resize(GuestStdString* s, uint64_t n) { w_resize_fill(s, n, 0); }
+void w_resize(GuestStdString* s, size_t n) { w_resize_fill(s, n, 0); }
 
 // insert(size_type, const char*, size_type) -> returns basic_string& (this)
-GuestStdString* w_insert_ptr_len(GuestStdString* s, uint64_t pos, const char* p, uint64_t n) {
+GuestStdString* w_insert_ptr_len(GuestStdString* s, size_t pos, const char* p, size_t n) {
   noteCompatCall("std::string::insert(size,const char*,size)");
   s = ensureValidString(s);
   gsReplace(s, size_t(pos), p, size_t(n));
@@ -477,14 +477,14 @@ GuestStdString* w_insert_ptr_len(GuestStdString* s, uint64_t pos, const char* p,
 }
 // insert(size_type, const char*) -> __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc
 // Exact symbol that caused SIGSEGV at faultAddr: 0x10 during PoolAllocator / mod_init!
-GuestStdString* w_insert_cstr(GuestStdString* s, uint64_t pos, const char* p) {
+GuestStdString* w_insert_cstr(GuestStdString* s, size_t pos, const char* p) {
   noteCompatCall("std::string::insert(size,const char*)");
   s = ensureValidString(s);
   gsReplace(s, size_t(pos), p, p ? std::strlen(p) : 0);
   return s;
 }
 // insert(size_type, const basic_string&)
-GuestStdString* w_insert_str(GuestStdString* s, uint64_t pos, const GuestStdString* other) {
+GuestStdString* w_insert_str(GuestStdString* s, size_t pos, const GuestStdString* other) {
   noteCompatCall("std::string::insert(size,const string&)");
   s = ensureValidString(s);
   if (!other) return s;
@@ -494,7 +494,7 @@ GuestStdString* w_insert_str(GuestStdString* s, uint64_t pos, const GuestStdStri
   return s;
 }
 // insert(size_type, const basic_string&, size_type, size_type)
-GuestStdString* w_insert_substr(GuestStdString* s, uint64_t pos, const GuestStdString* other, uint64_t subpos, uint64_t sublen) {
+GuestStdString* w_insert_substr(GuestStdString* s, size_t pos, const GuestStdString* other, size_t subpos, size_t sublen) {
   noteCompatCall("std::string::insert(size,const string&,size,size)");
   s = ensureValidString(s);
   if (!other) return s;
@@ -507,7 +507,7 @@ GuestStdString* w_insert_substr(GuestStdString* s, uint64_t pos, const GuestStdS
   return s;
 }
 // insert(size_type, size_type, char)
-GuestStdString* w_insert_fill(GuestStdString* s, uint64_t pos, uint64_t n, char c) {
+GuestStdString* w_insert_fill(GuestStdString* s, size_t pos, size_t n, char c) {
   noteCompatCall("std::string::insert(size,size,char)");
   s = ensureValidString(s);
   if (n == 0) return s;
@@ -517,7 +517,7 @@ GuestStdString* w_insert_fill(GuestStdString* s, uint64_t pos, uint64_t n, char 
 }
 
 // erase(size_type pos = 0, size_type n = npos)
-GuestStdString* w_erase(GuestStdString* s, uint64_t pos, uint64_t n) {
+GuestStdString* w_erase(GuestStdString* s, size_t pos, size_t n) {
   noteCompatCall("std::string::erase");
   s = ensureValidString(s);
   gsSplice(s, size_t(pos), size_t(n), "", 0);
@@ -525,21 +525,21 @@ GuestStdString* w_erase(GuestStdString* s, uint64_t pos, uint64_t n) {
 }
 
 // replace(size_type pos, size_type len, const char* p, size_type n)
-GuestStdString* w_replace_ptr_len(GuestStdString* s, uint64_t pos, uint64_t len, const char* p, uint64_t n) {
+GuestStdString* w_replace_ptr_len(GuestStdString* s, size_t pos, size_t len, const char* p, size_t n) {
   noteCompatCall("std::string::replace(pos,len,const char*,n)");
   s = ensureValidString(s);
   gsSplice(s, size_t(pos), size_t(len), p, size_t(n));
   return s;
 }
 // replace(size_type pos, size_type len, const char* p)
-GuestStdString* w_replace_cstr(GuestStdString* s, uint64_t pos, uint64_t len, const char* p) {
+GuestStdString* w_replace_cstr(GuestStdString* s, size_t pos, size_t len, const char* p) {
   noteCompatCall("std::string::replace(pos,len,const char*)");
   s = ensureValidString(s);
   gsSplice(s, size_t(pos), size_t(len), p, p ? std::strlen(p) : 0);
   return s;
 }
 // replace(size_type pos, size_type len, const basic_string& str)
-GuestStdString* w_replace_str(GuestStdString* s, uint64_t pos, uint64_t len, const GuestStdString* other) {
+GuestStdString* w_replace_str(GuestStdString* s, size_t pos, size_t len, const GuestStdString* other) {
   noteCompatCall("std::string::replace(pos,len,const string&)");
   s = ensureValidString(s);
   if (!other) return s;
@@ -549,7 +549,7 @@ GuestStdString* w_replace_str(GuestStdString* s, uint64_t pos, uint64_t len, con
   return s;
 }
 // replace(size_type pos, size_type len, size_type n, char c)
-GuestStdString* w_replace_fill(GuestStdString* s, uint64_t pos, uint64_t len, uint64_t n, char c) {
+GuestStdString* w_replace_fill(GuestStdString* s, size_t pos, size_t len, size_t n, char c) {
   noteCompatCall("std::string::replace(pos,len,n,char)");
   s = ensureValidString(s);
   std::vector<char> fill(size_t(n), c);
@@ -558,17 +558,17 @@ GuestStdString* w_replace_fill(GuestStdString* s, uint64_t pos, uint64_t len, ui
 }
 
 // libc++ internal helper: __grow_by_and_replace(old_cap, delta_cap, old_sz, n_copy, n_del, n_add, p_new_stuff)
-void w_grow_by_and_replace(GuestStdString* s, uint64_t /*old_cap*/, uint64_t /*delta_cap*/,
-                           uint64_t /*old_sz*/, uint64_t n_copy, uint64_t n_del,
-                           uint64_t n_add, const char* p_new_stuff) {
+void w_grow_by_and_replace(GuestStdString* s, size_t /*old_cap*/, size_t /*delta_cap*/,
+                           size_t /*old_sz*/, size_t n_copy, size_t n_del,
+                           size_t n_add, const char* p_new_stuff) {
   noteCompatCall("std::string::__grow_by_and_replace");
   s = ensureValidString(s);
   gsSplice(s, size_t(n_copy), size_t(n_del), p_new_stuff, size_t(n_add));
 }
 
 // libc++ internal helper: __grow_by(old_cap, delta_cap, old_sz, n_copy, n_del, n_add)
-void w_grow_by(GuestStdString* s, uint64_t old_cap, uint64_t delta_cap,
-               uint64_t old_sz, uint64_t n_copy, uint64_t n_del, uint64_t n_add) {
+void w_grow_by(GuestStdString* s, size_t old_cap, size_t delta_cap,
+               size_t old_sz, size_t n_copy, size_t n_del, size_t n_add) {
   noteCompatCall("std::string::__grow_by");
   s = ensureValidString(s);
   size_t newCap = std::max(size_t(old_cap + delta_cap), size_t(old_sz - n_del + n_add)) | 1;
@@ -580,8 +580,8 @@ void w_grow_by(GuestStdString* s, uint64_t old_cap, uint64_t delta_cap,
   size_t n_sec = (old_sz > n_del + n_copy) ? size_t(old_sz - n_del - n_copy) : 0;
   if (n_sec) std::memcpy(buf + copyHead + n_add, cur + copyHead + n_del, n_sec);
   s->releaseLong();
-  s->w[0] = (uint64_t(newCap) << 1) | 1;
-  s->w[2] = reinterpret_cast<uint64_t>(buf);
+  s->w[0] = (uintptr_t(newCap) << 1) | 1;
+  s->w[2] = reinterpret_cast<uintptr_t>(buf);
 }
 
 // compare(const char*) const
@@ -597,7 +597,7 @@ int w_compare_cstr(const GuestStdString* s, const char* rhs) {
   return sz < rl ? -1 : (sz > rl ? 1 : 0);
 }
 // compare(size_type, size_type, const char*, size_type) const
-int w_compare_sub_ptr_len(const GuestStdString* s, uint64_t pos1, uint64_t n1, const char* rhs, uint64_t n2) {
+int w_compare_sub_ptr_len(const GuestStdString* s, size_t pos1, size_t n1, const char* rhs, size_t n2) {
   noteCompatCall("std::string::compare(pos,n1,const char*,n2)");
   if (!rhs) { rhs = ""; n2 = 0; }
   size_t sz = s ? s->size() : 0;
@@ -611,72 +611,72 @@ int w_compare_sub_ptr_len(const GuestStdString* s, uint64_t pos1, uint64_t n1, c
   return len1 < len2 ? -1 : (len1 > len2 ? 1 : 0);
 }
 // compare(size_type, size_type, const char*) const
-int w_compare_sub_cstr(const GuestStdString* s, uint64_t pos1, uint64_t n1, const char* rhs) {
+int w_compare_sub_cstr(const GuestStdString* s, size_t pos1, size_t n1, const char* rhs) {
   return w_compare_sub_ptr_len(s, pos1, n1, rhs, rhs ? std::strlen(rhs) : 0);
 }
 
 // find(char, size_type) const
-uint64_t w_find_char(const GuestStdString* s, char c, uint64_t pos) {
+size_t w_find_char(const GuestStdString* s, char c, size_t pos) {
   noteCompatCall("std::string::find(char,size)");
-  if (!s) return ~uint64_t(0);
+  if (!s) return ~size_t(0);
   size_t sz = s->size();
-  if (pos >= sz) return ~uint64_t(0);
+  if (pos >= sz) return ~size_t(0);
   const char* d = s->data();
   const void* p = std::memchr(d + pos, static_cast<unsigned char>(c), sz - size_t(pos));
-  return p ? static_cast<uint64_t>( static_cast<const char*>(p) - d ) : ~uint64_t(0);
+  return p ? static_cast<size_t>(static_cast<const char*>(p) - d) : ~size_t(0);
 }
 // find(const char*, size_type, size_type) const
-uint64_t w_find_ptr_pos_len(const GuestStdString* s, const char* needle, uint64_t pos, uint64_t n) {
+size_t w_find_ptr_pos_len(const GuestStdString* s, const char* needle, size_t pos, size_t n) {
   noteCompatCall("std::string::find(const char*,pos,n)");
-  if (!s) return ~uint64_t(0);
+  if (!s) return ~size_t(0);
   size_t sz = s->size();
-  if (!needle || n == 0) return pos <= sz ? pos : ~uint64_t(0);
-  if (pos > sz || n > sz - pos) return ~uint64_t(0);
+  if (!needle || n == 0) return pos <= sz ? pos : ~size_t(0);
+  if (pos > sz || n > sz - pos) return ~size_t(0);
   const char* d = s->data();
   for (size_t i = size_t(pos); i + n <= sz; ++i) {
     if (std::memcmp(d + i, needle, size_t(n)) == 0) return i;
   }
-  return ~uint64_t(0);
+  return ~size_t(0);
 }
 // rfind(char, size_type) const
-uint64_t w_rfind_char(const GuestStdString* s, char c, uint64_t pos) {
+size_t w_rfind_char(const GuestStdString* s, char c, size_t pos) {
   noteCompatCall("std::string::rfind(char,size)");
-  if (!s) return ~uint64_t(0);
+  if (!s) return ~size_t(0);
   size_t sz = s->size();
-  if (sz == 0) return ~uint64_t(0);
+  if (sz == 0) return ~size_t(0);
   size_t i = std::min(size_t(pos), sz - 1);
   const char* d = s->data();
   for (;; --i) {
     if (d[i] == c) return i;
     if (i == 0) break;
   }
-  return ~uint64_t(0);
+  return ~size_t(0);
 }
 // rfind(const char*, size_type, size_type) const
-uint64_t w_rfind_ptr_pos_len(const GuestStdString* s, const char* needle, uint64_t pos, uint64_t n) {
+size_t w_rfind_ptr_pos_len(const GuestStdString* s, const char* needle, size_t pos, size_t n) {
   noteCompatCall("std::string::rfind(const char*,pos,n)");
-  if (!s) return ~uint64_t(0);
+  if (!s) return ~size_t(0);
   size_t sz = s->size();
   if (!needle || n == 0) return std::min(size_t(pos), sz);
-  if (n > sz) return ~uint64_t(0);
+  if (n > sz) return ~size_t(0);
   size_t start = std::min(size_t(pos), sz - size_t(n));
   const char* d = s->data();
   for (size_t i = start;; --i) {
     if (std::memcmp(d + i, needle, size_t(n)) == 0) return i;
     if (i == 0) break;
   }
-  return ~uint64_t(0);
+  return ~size_t(0);
 }
 
 // at(size_type)
-char* w_at(GuestStdString* s, uint64_t pos) {
+char* w_at(GuestStdString* s, size_t pos) {
   noteCompatCall("std::string::at");
   s = ensureValidString(s);
   size_t sz = s->size();
   if (pos >= sz) return s->data();
   return s->data() + pos;
 }
-const char* w_at_const(const GuestStdString* s, uint64_t pos) {
+const char* w_at_const(const GuestStdString* s, size_t pos) {
   return w_at(const_cast<GuestStdString*>(s), pos);
 }
 
@@ -763,12 +763,47 @@ size_t w_next_prime(size_t requested) {
 template <class F> uint64_t fn(F* f) { return reinterpret_cast<uint64_t>(f); }
 
 // basic_string data symbol: std::string::npos lives in the dylib on iOS.
-const uint64_t kGuestNpos = ~uint64_t(0);
+const size_t kGuestNpos = ~size_t(0);
 
 constexpr const char* S = "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE";
 constexpr const char* SC = "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE";
 
 }  // namespace
+
+std::string arm32ManglingAlias(const std::string& mangled) {
+  // The helper has a separate non-template class encoding and is convenient to handle directly.
+  if (mangled == "__ZNSt3__112__next_primeEm") return "__ZNSt3__112__next_primeEj";
+
+  // Find the end of basic_string's nested class/template type, then skip the method name before
+  // rewriting parameter type codes. This avoids changing an `m` inside a spelling such as
+  // `compare`, and keeps the ARM64 table entries byte-for-byte intact.
+  const size_t classEnd = mangled.rfind("EEE");
+  if (classEnd == std::string::npos) return mangled;
+  size_t pos = classEnd + 3;
+  if (pos >= mangled.size()) return mangled;
+  if ((mangled[pos] == 'C' || mangled[pos] == 'D') && pos + 1 < mangled.size() &&
+      (mangled[pos + 1] == '1' || mangled[pos + 1] == '2')) {
+    pos += 2;  // C1/C2 constructors, D1/D2 destructors
+  } else if (mangled[pos] == 'a' && pos + 1 < mangled.size() && mangled[pos + 1] == 'S') {
+    pos += 2;  // operator=
+  } else if (mangled[pos] >= '0' && mangled[pos] <= '9') {
+    size_t nameLength = 0;
+    while (pos < mangled.size() && mangled[pos] >= '0' && mangled[pos] <= '9') {
+      const size_t digit = static_cast<size_t>(mangled[pos++] - '0');
+      if (nameLength > (mangled.size() - digit) / 10) return mangled;
+      nameLength = nameLength * 10 + digit;
+    }
+    if (nameLength > mangled.size() - pos) return mangled;
+    pos += nameLength;
+  } else {
+    return mangled;
+  }
+
+  std::string alias = mangled;
+  for (; pos < alias.size(); ++pos)
+    if (alias[pos] == 'm') alias[pos] = 'j';  // unsigned long -> unsigned int on 32-bit ABIs
+  return alias;
+}
 
 const std::vector<CxxForwardEntry>& cxxForwardTable() {
   static const std::vector<CxxForwardEntry> real = [] {
@@ -853,6 +888,14 @@ const std::vector<CxxForwardEntry>& cxxForwardTable() {
     add("__ZNSt3__18ios_base4InitC2Ev", fn(w_ios_init_ctor), "std::ios_base::Init::Init() [base]");
     add("__ZNSt3__18ios_base4InitD1Ev", fn(w_ios_init_dtor), "std::ios_base::Init::~Init()");
     add("__ZNSt3__18ios_base4InitD2Ev", fn(w_ios_init_dtor), "std::ios_base::Init::~Init() [base]");
+    if constexpr (sizeof(size_t) == 4) {
+      const size_t nativeEntryCount = t.size();
+      for (size_t i = 0; i < nativeEntryCount; ++i) {
+        std::string alias = arm32ManglingAlias(t[i].mangled);
+        if (alias != t[i].mangled)
+          add(alias, t[i].impl, (t[i].what + " [32-bit size_t ABI]").c_str(), t[i].data);
+      }
+    }
     return t;
   }();
   return real;
