@@ -27,6 +27,8 @@ and execution on an ARM64 device were **not** verified in this environment.
 ### Follow-up hardening
 - Bundle icon selection now resolves declared @2x/@3x/~ipad renditions and rejects icons symlinked outside the imported .app.
 - Android re-import preserves the prior bundle and icon until replacement inspection and library storage complete; library writes use AtomicFile.
+- Fixed Android `.ipa` import failing with `bundle path is not an .app directory` after moving the staged `.app` bundle into `games/<bundleId>/bundle.app`, and taught `ipa::inspectBundle` to accept relocated bundle directories containing `Info.plist` as well as trailing slashes and case-insensitive `.app` / `Info.plist` / executable names.
+- Hardened IPA plist/icon/Mach-O import handling (Xcode icon size suffixes, `.png` stem stripping, palette/16-bit PNGs, CgBI trailing padding, threaded bind opcodes `0xD0`, library game removal, and APK version bump to `0.2.0`).
 
 ## 2026-10-03 - multi-image loading and Objective-C metadata reading
 
