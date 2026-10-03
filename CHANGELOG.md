@@ -3,6 +3,21 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - Android APK build fix and architecture-aware settings
+
+Host suite: **476 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
+
+- Fixed the ARM64 NDK compile failure: Android Bionic defines `st_atime_nsec`, `st_mtime_nsec`,
+  and `st_ctime_nsec` as macros. The Darwin `stat` compatibility layout now uses neutral internal
+  field names while preserving its 144-byte ABI size.
+- Added a blue Settings button and persistent, real ARM64 controls: compatibility fallbacks
+  (enabled by default, as before) and sampled missing-API tracing (off by default to reduce
+  guest-call overhead). Both settings are passed through the guest service to native execution.
+- Split out an ARM32 section that clearly states execution is not packaged; it intentionally
+  offers no ineffective switches. ARM32-only bundles remain inspectable but cannot run.
+- CI now builds and validates the ARM64 APK on pull requests, checks that the JNI `.so` is inside
+  the APK, and publishes release APKs only from `main`.
+
 ## 2026-10-03 - PoolAllocator libc++ string fix, POSIX sandbox & EAGL/GLESv2 bridge (batch 4)
 
 Host suite: **473 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan). Targets the
