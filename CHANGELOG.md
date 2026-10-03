@@ -3,6 +3,30 @@
 All notable changes to RadekiOSNative. The project source ships as `RadekiOSNative.zip`; this
 file is the channel log for that artifact and lives beside it in the repository root.
 
+## 2026-10-03 - libc++ hash-table crash fix, launch-path overhead and UIKit status clarity
+
+Host suite: **486 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
+The Android NDK/APK build and real-device Minecraft execution could not be verified here.
+
+- Implemented the exact libc++ import `__ZNSt3__112__next_primeEm` reported as a no-op stub
+  immediately before a SIGSEGV in `std::__1::__hash_table<ChunkPos>::__insert_unique`. The
+  wrapper preserves libc++'s zero/empty-table case and otherwise returns the smallest prime at
+  least the requested bucket count, with deterministic 64-bit Miller-Rabin checks and overflow
+  protection. Added tests for symbol binding, edge values, a range of bucket counts, and a
+  near-`SIZE_MAX` prime.
+- Reduced compatibility-call tracing overhead: literal wrapper names now bypass temporary
+  `std::string` creation, recent-call history uses a fixed 32-entry ring rather than a deque of
+  heap-backed strings, and stub fallback launch no longer constructs an unused second registry.
+- Kept the capability report honest and more specific: UIKit remains **Unsupported**. The
+  existing startup shims are not a UIKit runtime and do not provide the application event loop,
+  view/rendering pipeline or Android surface integration required to show a boot screen. The
+  Settings description, compatibility summary and the `UIApplicationMain` placeholder output now
+  say so rather than implying fallback mode is a complete game compatibility layer.
+
+The reported `__next_prime` fault path is addressed in source, but further runtime failures may
+follow. It must be retested with the rebuilt APK; no claim is made that Minecraft now reaches its
+boot screen.
+
 ## 2026-10-03 - Android APK build fix and architecture-aware settings
 
 Host suite: **476 checks, 0 failures**, clean under `make SAN=1 test` (ASan + UBSan).
